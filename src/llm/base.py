@@ -20,10 +20,22 @@ Role = Literal["system", "user", "assistant", "tool"]
 
 @dataclass
 class Message:
-    """A single message exchanged with an LLM."""
+    """A single message exchanged with an LLM.
+
+    Plain conversation messages only use `role` and `content`. Two
+    optional, provider-independent fields support tool-calling
+    conversations:
+
+    * `tool_calls`: normalized ToolCalls carried by an assistant message
+      that requested tools.
+    * `tool_call_id`: the id of the assistant's tool call that a
+      ``role="tool"`` result message answers.
+    """
 
     role: Role
     content: str
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 @dataclass

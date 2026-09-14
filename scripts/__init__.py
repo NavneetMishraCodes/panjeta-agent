@@ -1,0 +1,1 @@
+"""Optional manual scripts for Panjeta (not part of the automated test suite)."""

@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from src.llm.base import LLMResponse, ToolCall
+from src.llm.base import LLMResponse, Message, ToolCall
 from src.llm.openrouter import OpenRouterLLM, OpenRouterToolCallError
 
 
@@ -91,6 +91,61 @@ class ToolCallNormalizationTest(unittest.TestCase):
 
         with self.assertRaises(OpenRouterToolCallError):
             OpenRouterLLM._to_llm_response(completion)
+
+
+class OpenRouterMessageConversionTest(unittest.TestCase):
+    """Offline checks for Message -> OpenAI-compatible conversion."""
+
+    def test_plain_message_converts_unchanged(self) -> None:
+        self.assertEqual(
+            OpenRouterLLM._to_openai_message(
+                Message(role="user", content="hi")
+            ),
+            {"role": "user", "content": "hi"},
+        )
+
+    def test_tool_result_message_includes_tool_call_id(self) -> None:
+        message = Message(role="tool", content="110", tool_call_id="call_1")
+        self.assertEqual(
+            OpenRouterLLM._to_openai_message(message),
+            {"role": "tool", "content": "110", "tool_call_id": "call_1"},
+        )
+
+    def test_assistant_tool_calls_are_converted(self) -> None:
+        message = Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call_1",
+                    name="calculator",
+                    arguments={"expression": "25 * 4 + 10"},
+                )
+            ],
+        )
+        converted = OpenRouterLLM._to_openai_message(message)
+        self.assertEqual(converted["role"], "assistant")
+        self.assertEqual(converted["content"], "")
+        self.assertEqual(
+            converted["tool_calls"],
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression": "25 * 4 + 10"}',
+                    },
+                }
+            ],
+        )
+
+    def test_empty_tool_calls_list_is_omitted(self) -> None:
+        message = Message(role="assistant", content="plain", tool_calls=[])
+        self.assertEqual(
+            OpenRouterLLM._to_openai_message(message),
+            {"role": "assistant", "content": "plain"},
+        )
 
 
 if __name__ == "__main__":

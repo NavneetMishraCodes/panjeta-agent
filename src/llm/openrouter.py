@@ -101,9 +101,37 @@ class OpenRouterLLM(BaseLLM):
         return self._to_llm_response(completion)
 
     @staticmethod
-    def _to_openai_message(message: Message) -> dict[str, str]:
-        """Convert a Panjeta Message into an OpenAI-compatible message dict."""
-        return {"role": message.role, "content": message.content}
+    def _to_openai_message(message: Message) -> dict[str, Any]:
+        """Convert a Panjeta Message into an OpenAI-compatible message dict.
+
+        Plain messages convert to ``{role, content}`` as before. Messages
+        carrying tool context add OpenAI's `tool_call_id` (tool results)
+        or `tool_calls` (assistant requests) fields.
+        """
+        converted: dict[str, Any] = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_call_id is not None:
+            converted["tool_call_id"] = message.tool_call_id
+        if message.tool_calls:
+            converted["tool_calls"] = [
+                OpenRouterLLM._to_openai_tool_call(call)
+                for call in message.tool_calls
+            ]
+        return converted
+
+    @staticmethod
+    def _to_openai_tool_call(call: ToolCall) -> dict[str, Any]:
+        """Convert a normalized ToolCall into an OpenAI-compatible tool-call dict."""
+        return {
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": json.dumps(call.arguments),
+            },
+        }
 
     @staticmethod
     def _to_openai_tool(tool: ToolDefinition) -> dict[str, Any]:
