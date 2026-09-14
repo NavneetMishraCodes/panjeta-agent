@@ -1,0 +1,5 @@
+# Panjeta Agent - project dependencies
+#
+# Intentionally minimal for now: no AI frameworks (e.g. LangChain,
+# LangGraph) and no provider-specific SDKs have been added yet.
+# Dependencies will be introduced as they become necessary.
