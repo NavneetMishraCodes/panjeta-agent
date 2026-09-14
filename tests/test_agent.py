@@ -7,11 +7,13 @@ errors, unknown tools, iteration limits, and conversation-history order.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.agent import Agent, AgentMaximumIterationsError
 from src.llm.base import BaseLLM, LLMResponse, Message, ToolCall, ToolDefinition
-from src.tools import ToolRegistry, calculator_tool
+from src.tools import ToolRegistry, calculator_tool, search_files_tool
 
 
 class FakeLLM(BaseLLM):
@@ -338,6 +340,59 @@ class AgentIterationLimitTest(unittest.TestCase):
     def test_default_max_iterations_is_eight(self) -> None:
         agent = Agent(llm=FakeLLM(), registry=_registry_with_calculator())
         self.assertEqual(agent.max_iterations, 8)
+
+
+class AgentFileSearchTest(unittest.TestCase):
+    """Offline integration: Agent + ToolRegistry + search_files via FakeLLM."""
+
+    def test_search_files_executes_through_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "math_notes.pdf").write_text("x" * 100)
+            (root / "english_doc.docx").write_text("y")
+            (root / "sub").mkdir()
+            (root / "sub" / "math_practice.pdf").write_text("z")
+
+            fake = FakeLLM(
+                scripted=[
+                    LLMResponse(
+                        content="",
+                        tool_calls=[
+                            _tool_call(
+                                "s1",
+                                "search_files",
+                                {
+                                    "root": str(root),
+                                    "query": "math",
+                                    "extension": ".pdf",
+                                },
+                            )
+                        ],
+                    ),
+                    LLMResponse(content="Found your math PDFs."),
+                ]
+            )
+            registry = _registry_with_calculator()
+            registry.register(search_files_tool())
+            agent = Agent(llm=fake, registry=registry)
+
+            result = agent.run("Find the math PDFs.")
+
+            self.assertEqual(result, "Found your math PDFs.")
+            self.assertEqual(fake.call_count, 2)
+            # The real search_files tool ran through the ToolRegistry.
+            self.assertEqual(registry.executed[0][0], "search_files")
+            self.assertEqual(
+                registry.executed[0][1],
+                {"root": str(root), "query": "math", "extension": ".pdf"},
+            )
+            # Its result was fed back to the LLM as a tool message.
+            messages, _ = fake.calls[1]
+            tool_result = messages[2].content
+            self.assertEqual(messages[2].role, "tool")
+            self.assertEqual(messages[2].tool_call_id, "s1")
+            self.assertIn("math_notes.pdf", tool_result)
+            self.assertNotIn("english_doc.docx", tool_result)
 
 
 if __name__ == "__main__":
