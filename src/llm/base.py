@@ -42,15 +42,34 @@ class ToolDefinition:
 
 
 @dataclass
+class ToolCall:
+    """A normalized tool invocation requested by the LLM.
+
+    `arguments` holds the parsed (JSON-decoded) arguments as a dict, so
+    consumers never have to parse provider-specific argument strings
+    themselves. This is a description of a call the model wants to make;
+    it does not execute anything.
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class LLMResponse:
     """A normalized response returned by any LLM provider.
 
-    `content` holds the plain-text reply. `raw` optionally carries the
-    provider's original response object for cases where more detail is
-    needed later, without leaking provider-specific shape into `content`.
+    `content` holds the plain-text reply (an empty string when the model
+    only made tool calls). `tool_calls` lists any tool invocations the
+    model requested, normalized into generic ToolCall objects. `raw`
+    optionally carries the provider's original response object for
+    debugging / provider-specific needs; agent logic should not depend
+    on it.
     """
 
     content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
     raw: Any = None
 
 

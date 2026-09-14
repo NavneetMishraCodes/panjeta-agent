@@ -9,12 +9,19 @@ leak outside this module.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
 from openai import OpenAI
 
-from src.llm.base import BaseLLM, LLMResponse, Message, ToolDefinition
+from src.llm.base import (
+    BaseLLM,
+    LLMResponse,
+    Message,
+    ToolCall,
+    ToolDefinition,
+)
 
 # OpenRouter's OpenAI-compatible API base URL.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -26,6 +33,10 @@ MODEL_ENV_VAR = "OPENROUTER_MODEL"
 
 class OpenRouterConfigError(RuntimeError):
     """Raised when required OpenRouter configuration is missing."""
+
+
+class OpenRouterToolCallError(RuntimeError):
+    """Raised when a tool call in an OpenRouter response cannot be normalized."""
 
 
 class OpenRouterLLM(BaseLLM):
@@ -73,9 +84,9 @@ class OpenRouterLLM(BaseLLM):
             tools: Optional tool definitions the model may choose to call.
 
         Returns:
-            A normalized LLMResponse. Any tool calls requested by the
-            model are preserved on `raw` for a future agent loop to
-            interpret; they are not executed here.
+            A normalized LLMResponse. Any tool calls requested by the model
+            are converted into generic ToolCall objects on the response;
+            they are not executed here.
         """
         request_kwargs: dict[str, Any] = {
             "model": self._model,
@@ -110,10 +121,50 @@ class OpenRouterLLM(BaseLLM):
     def _to_llm_response(completion: Any) -> LLMResponse:
         """Convert an OpenAI-compatible completion into a normalized LLMResponse.
 
-        The full provider response is kept on `raw` so a future agent loop
-        can inspect details such as tool calls (`choices[0].message.tool_calls`)
-        without this adapter needing to interpret or execute them now.
+        Provider-specific structures (e.g. `choices[0].message.tool_calls`)
+        are converted here into Panjeta's generic `ToolCall` list and must
+        not leak outside this adapter. The full raw completion is preserved
+        on `LLMResponse.raw` for debugging or provider-specific needs.
         """
-        choice = completion.choices[0]
-        content = choice.message.content or ""
-        return LLMResponse(content=content, raw=completion)
+        message = completion.choices[0].message
+        content = message.content or ""
+        return LLMResponse(
+            content=content,
+            tool_calls=OpenRouterLLM._normalize_tool_calls(message.tool_calls),
+            raw=completion,
+        )
+
+    @staticmethod
+    def _normalize_tool_calls(provider_tool_calls: Any) -> list[ToolCall]:
+        """Convert OpenAI-compatible tool calls into generic ToolCall objects.
+
+        An empty result (`[]`) is returned when the model made no tool calls.
+        """
+        if not provider_tool_calls:
+            return []
+        return [OpenRouterLLM._to_tool_call(call) for call in provider_tool_calls]
+
+    @staticmethod
+    def _to_tool_call(call: Any) -> ToolCall:
+        """Convert a single OpenAI-compatible tool call into a generic ToolCall.
+
+        `arguments` is expected to be a JSON object string; it is parsed
+        into a dict. Malformed or non-object JSON fails loudly with
+        OpenRouterToolCallError instead of silently producing bad data.
+        """
+        function = call.function
+        try:
+            arguments = json.loads(function.arguments or "{}")
+        except json.JSONDecodeError as error:
+            raise OpenRouterToolCallError(
+                f"Failed to parse JSON arguments for tool call {call.id!r} "
+                f"({function.name!r}): {error}"
+            ) from error
+
+        if not isinstance(arguments, dict):
+            raise OpenRouterToolCallError(
+                f"Tool call {call.id!r} ({function.name!r}) arguments parsed "
+                f"to {type(arguments).__name__}, expected a JSON object."
+            )
+
+        return ToolCall(id=call.id, name=function.name, arguments=arguments)

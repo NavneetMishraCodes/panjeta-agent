@@ -18,6 +18,13 @@ __all__ = ["main"]
 
 def main() -> None:
     """Load config, send one test message via OpenRouter, print the result."""
+    # Ensure model replies (which may contain emoji/Unicode) can be printed
+    # on Windows consoles that default to cp1252.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
     load_dotenv()
 
     try:
