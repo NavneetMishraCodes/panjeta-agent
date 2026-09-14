@@ -1,5 +1,13 @@
 # Panjeta Agent - project dependencies
 #
-# Intentionally minimal for now: no AI frameworks (e.g. LangChain,
-# LangGraph) and no provider-specific SDKs have been added yet.
-# Dependencies will be introduced as they become necessary.
+# Intentionally minimal: no AI frameworks (e.g. LangChain, LangGraph),
+# no vector databases, no memory systems. Dependencies are introduced
+# only as they become necessary.
+
+# Official OpenAI SDK - used because OpenRouter exposes an
+# OpenAI-compatible API. This is NOT an OpenAI-the-company integration.
+openai
+
+# Loads environment variables (e.g. OPENROUTER_API_KEY) from a local
+# .env file for development.
+python-dotenv

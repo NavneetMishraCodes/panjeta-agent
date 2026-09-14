@@ -1,19 +1,46 @@
-"""Tiny entry point for Panjeta Agent.
+"""Entry point for Panjeta Agent.
 
-This does not run the agent or call any LLM. Its only job, for now, is to
-prove that the project's package structure imports correctly.
+For this mission, this performs a minimal real API call through the
+OpenRouter provider adapter to prove the provider-independent stack
+(BaseLLM -> OpenRouterLLM -> OpenRouter API) works end to end. It does
+not implement the agent loop or tool execution.
 """
 
-from src.llm.base import BaseLLM, LLMResponse, Message, ToolDefinition
+import sys
+
+from dotenv import load_dotenv
+
+from src.llm.base import Message
+from src.llm.openrouter import OpenRouterConfigError, OpenRouterLLM
 
 __all__ = ["main"]
 
 
 def main() -> None:
-    """Verify the project structure is importable and print a status line."""
-    print("Panjeta Agent project structure is set up correctly.")
-    print(f"Loaded: {BaseLLM.__name__}, {Message.__name__}, "
-          f"{ToolDefinition.__name__}, {LLMResponse.__name__}")
+    """Load config, send one test message via OpenRouter, print the result."""
+    load_dotenv()
+
+    try:
+        llm = OpenRouterLLM()
+    except OpenRouterConfigError as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        print(
+            "Copy .env.example to .env and set OPENROUTER_API_KEY and "
+            "OPENROUTER_MODEL before running this again.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    messages = [Message(role="user", content="Hello from Panjeta.")]
+
+    try:
+        response = llm.send_messages(messages)
+    except Exception as error:  # noqa: BLE001 - surface any provider-call failure
+        print(f"OpenRouter request failed: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Panjeta Agent - OpenRouter test call succeeded.")
+    print(f"Response: {response.content}")
 
 
 if __name__ == "__main__":
