@@ -39,6 +39,10 @@ htmlcov/
 .tox/
 .nox/
 
+# --- Logs (generated Panjeta logs) ---
+logs/
+*.log
+
 # --- Type checkers / linters ---
 .mypy_cache/
 .dmypy.json

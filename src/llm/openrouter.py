@@ -16,6 +16,7 @@ from typing import Any
 from openai import OpenAI
 
 from src.llm.base import (
+    LLMConfigError,
     BaseLLM,
     LLMResponse,
     Message,
@@ -31,7 +32,7 @@ API_KEY_ENV_VAR = "OPENROUTER_API_KEY"
 MODEL_ENV_VAR = "OPENROUTER_MODEL"
 
 
-class OpenRouterConfigError(RuntimeError):
+class OpenRouterConfigError(LLMConfigError):
     """Raised when required OpenRouter configuration is missing."""
 
 

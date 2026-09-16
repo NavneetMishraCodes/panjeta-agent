@@ -8,6 +8,9 @@
 # OpenAI-compatible API. This is NOT an OpenAI-the-company integration.
 openai
 
-# Loads environment variables (e.g. OPENROUTER_API_KEY) from a local
-# .env file for development.
+# Official Google Gemini SDK - used by the "google" provider adapter.
+google-genai
+
+# Loads environment variables (e.g. OPENROUTER_API_KEY, GOOGLE_API_KEY)
+# from a local .env file for development.
 python-dotenv

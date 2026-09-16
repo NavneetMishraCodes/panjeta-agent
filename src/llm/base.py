@@ -18,6 +18,17 @@ from typing import Any, Literal
 Role = Literal["system", "user", "assistant", "tool"]
 
 
+class LLMConfigError(RuntimeError):
+    """Base class for provider configuration failures.
+
+    Providers raise this when required configuration (typically an API key
+    or a model identifier) cannot be resolved from explicit arguments or
+    environment variables. Centralizing it lets callers such as the
+    interactive entry point report configuration problems without knowing
+    which provider is in use.
+    """
+
+
 @dataclass
 class Message:
     """A single message exchanged with an LLM.
