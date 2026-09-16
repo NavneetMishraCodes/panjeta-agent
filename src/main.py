@@ -26,6 +26,16 @@ from dotenv import load_dotenv
 from src.agent import Agent, AgentMaximumIterationsError
 from src.llm import LLMConfigError, create_llm
 from src.tools import ToolRegistry, calculator_tool, search_files_tool
+from src.tools.file_manager import (
+    copy_file_tool,
+    create_file_tool,
+    delete_file_tool,
+    list_directory_tool,
+    move_file_tool,
+    read_file_tool,
+    rename_file_tool,
+)
+from src.tools.paths import resolve_file_root
 from src.ui import (
     is_exit_command,
     print_agent_output,
@@ -36,7 +46,12 @@ from src.ui import (
 SYSTEM_PROMPT = (
     "You are Panjeta, a helpful local computer agent. You answer in plain "
     "text. When a task needs a calculation, use the calculator tool. When a "
-    "task needs to locate files on this computer, use the search_files tool."
+    "task needs to locate files on this computer, use the search_files tool. "
+    "For folders and files inside the Panjeta file root, use the file-manager "
+    "tools (list_directory, read_file, create_file, copy_file, move_file, "
+    "rename_file, delete_file); their paths are relative to that root. "
+    "delete_file is destructive: before calling it with confirm=true, make "
+    "sure the user explicitly asked for the deletion."
 )
 
 DEFAULT_PROVIDER = "openrouter"
@@ -82,6 +97,16 @@ def _build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(calculator_tool())
     registry.register(search_files_tool())
+    for factory in (
+        list_directory_tool,
+        read_file_tool,
+        create_file_tool,
+        copy_file_tool,
+        move_file_tool,
+        rename_file_tool,
+        delete_file_tool,
+    ):
+        registry.register(factory())
     return registry
 
 
@@ -141,6 +166,7 @@ def main(argv=None) -> int:
         return 1
 
     print(f"[provider: {provider}]")
+    print(f"[file root: {resolve_file_root()}]")
     return run_interactive(agent)
 
 
