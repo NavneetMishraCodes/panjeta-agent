@@ -30,6 +30,12 @@ class Tool:
 
     definition: ToolDefinition
     function: Callable[[dict[str, Any]], Any]
+    # Approval metadata: when requires_approval is True, the registry asks
+    # its configured Approver (a real human in interactive use) before the
+    # function runs. confirm-style flags supplied by the LLM are *not*
+    # approval -- they only force the model to state its intent explicitly.
+    requires_approval: bool = False
+    approval_prompt: Callable[[dict[str, Any]], str] | None = None
 
     @property
     def name(self) -> str:

@@ -15,6 +15,8 @@ provider-specific conversion).
 
 from __future__ import annotations
 
+from typing import Any
+
 from src.llm.base import BaseLLM, LLMResponse, Message, ToolCall
 from src.tools import (
     ToolArgumentError,
@@ -45,6 +47,29 @@ _TOOL_ERRORS = (
 DEFAULT_MAX_ITERATIONS = 8
 
 
+def _as_documents(messages: list[Message]) -> list[dict[str, Any]]:
+    """Convert generic Messages into JSON-safe session documents."""
+    documents: list[dict[str, Any]] = []
+    for message in messages:
+        entry: dict[str, Any] = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_call_id is not None:
+            entry["tool_call_id"] = message.tool_call_id
+        if message.tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+                for call in message.tool_calls
+            ]
+        documents.append(entry)
+    return documents
+
+
 class Agent:
     """A minimal tool-using agent.
 
@@ -63,6 +88,7 @@ class Agent:
         registry: ToolRegistry,
         system_prompt: str | None = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        store: Any | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be >= 1.")
@@ -70,9 +96,16 @@ class Agent:
         self._registry = registry
         self._system_prompt = system_prompt
         self.max_iterations = max_iterations
+        # Optional persistence (src.session.SessionStore duck-type: load(),
+        # save(messages)). When absent the Agent behaves exactly as before:
+        # history is rebuilt from scratch on every run().
+        self._store = store
+        self._past_messages: list[dict[str, Any]] = []
+        if store is not None:
+            self._past_messages = store.load()
 
     def run(self, user_message: str) -> str:
-        """Run one conversation: return the final assistant text.
+        """Run one conversation turn: return the final assistant text.
 
         Raises:
             AgentMaximumIterationsError: If the model keeps requesting
@@ -88,6 +121,7 @@ class Agent:
             history.append(self._assistant_message(response))
 
             if not response.tool_calls:
+                self._persist(history)
                 return response.content
 
             for call in response.tool_calls:
@@ -106,8 +140,50 @@ class Agent:
         history: list[Message] = []
         if self._system_prompt:
             history.append(Message(role="system", content=self._system_prompt))
+        # Re-attach prior conversation context (session persistence). The
+        # system prompt is regenerated fresh, never restored from disk.
+        for entry in self._past_messages:
+            if entry.get("role") == "system":
+                continue
+            tool_calls = entry.get("tool_calls")
+            history.append(
+                Message(
+                    role=entry["role"],
+                    content=entry["content"],
+                    tool_call_id=entry.get("tool_call_id"),
+                    tool_calls=(
+                        [
+                            ToolCall(
+                                id=call["id"],
+                                name=call["name"],
+                                arguments=call.get("arguments", {}),
+                            )
+                            for call in tool_calls
+                            if isinstance(call, dict) and "name" in call
+                        ]
+                        if tool_calls
+                        else None
+                    ),
+                )
+            )
         history.append(Message(role="user", content=user_message))
         return history
+
+    def _persist(self, history: list[Message]) -> None:
+        """Merge this run's messages into the persisted history.
+
+        history = [system?] + restored + [user, assistant, tool, ...];
+        only the restored and new (non-system) parts are stored.
+        """
+        if self._store is None:
+            return
+        prefix = 1 if self._system_prompt else 0
+        restored = len(self._past_messages)
+        new_documents = _as_documents(history[prefix + restored :])
+        merged = self._past_messages + new_documents
+        self._store.save(merged)
+        # Mirror the store's own bound so repeated runs do not grow memory.
+        self._past_messages = merged[-self._store.max_messages :]
 
     @staticmethod
     def _assistant_message(response: LLMResponse) -> Message:

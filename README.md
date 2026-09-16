@@ -18,14 +18,21 @@
 * A local terminal entry point whose startup message is generated in plain
   Python — no LLM call, no tokens spent.
 * A **controlled file-manager tool family** (`list_directory`, `read_file`,
-  `create_file`, `copy_file`, `move_file`, `rename_file`, `delete_file`)
-  operating strictly inside a configurable filesystem sandbox
-  (`PANJETA_FILE_ROOT`).
+  `create_file`, `copy_file`, `move_file`, `rename_file`, `delete_file`,
+  `create_directory`, `delete_directory`, `move_directory`) operating
+  strictly inside a configurable filesystem sandbox (`PANJETA_FILE_ROOT`).
+* A **real human-approval layer**: destructive tools (the two deletions)
+  pause and ask the actual user at the console —
+  `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text is never
+  treated as approval.
+* **Persistent session state**: the interactive conversation is stored in a
+  bounded, versioned JSON file and restored on the next launch.
 
-**Not yet implemented** (documented goals only): persistent memory, WhatsApp
-integration, OCR, PDF/image content extraction, embeddings/vector search,
-browser automation, GUI/keyboard/mouse automation, and arbitrary computer
-control.
+**Not yet implemented** (documented goals only): long-term semantic memory
+(Panjeta restores recent conversation context, not human-like memory),
+WhatsApp integration, OCR, PDF/image content extraction, embeddings/vector
+search, browser automation, GUI/keyboard/mouse automation, recursive
+directory deletion, and arbitrary computer control.
 
 ## 🛠️ Tech Stack
 
@@ -48,15 +55,20 @@ User instruction (typed locally)
         ↓
 PANJETA AGENT banner / prompt   ← generated locally, no LLM, no tokens
         ↓
+SessionStore.load  (data/session.json)   ← optional, offline, gitignored
+        ↓
 src/agent/agent.py  (Agent.run - tool-calling loop, max 8 iterations)
         ↓
 src/llm/base.py  (BaseLLM / Message / ToolCall / ToolDefinition / LLMResponse)
         ↓
 OpenRouterLLM  OR  GoogleLLM          (selected via create_llm)
         ↓
-ToolRegistry  →  calculator | search_files | file-manager tools   (all tool execution)
+ToolRegistry → file-manager | calculator | search_files   (all tool execution)
+        |            destructive tools pass the human-approval gate first
         ↓
 Final answer printed locally
+        ↓
+SessionStore.save  (bounded history restored on the next launch)
 ```
 
 ### Layers
@@ -80,13 +92,26 @@ Final answer printed locally
   (read-only filename/metadata search, contents never read), and the
   file-manager family in `src/tools/file_manager.py`, guarded by the
   sandbox in `src/tools/paths.py`. Tools never run shell commands.
+* **`src/approval.py`** — the human-approval layer: the `Approver`
+  protocol, the console implementation (`ConsoleApprover`, explicit
+  `y`/`yes` only, default deny), and `ApprovalDeniedError`. The
+  `ToolRegistry` consults the approver before executing any tool marked
+  `requires_approval`. LLM providers and the Agent's reasoning are never
+  involved in approval decisions.
+* **`src/session.py`** — `SessionStore`: a versioned, bounded JSON session
+  file (default `<project>/data/session.json`, gitignored;
+  `PANJETA_SESSION_FILE` overrides the location). Saving is atomic; a
+  missing file starts a new session, and malformed/incompatible files are
+  logged and replaced rather than crashing Panjeta. This is conversational
+  context only — **not** semantic memory.
 * **`src/ui.py`** — minimal local terminal interface (banner, prompt,
   output). No LLM involvement.
 * **`src/main.py`** — interactive entry point.
 
 ### Filesystem tools & safety boundary
 
-The file-manager tools operate **only** inside the Panjeta filesystem root:
+The file-manager tools (files **and** directories) operate **only** inside
+the Panjeta filesystem root:
 
 * Selected with the `PANJETA_FILE_ROOT` environment variable (absolute path
   recommended). When unset, a safe default of `<project folder>/panjeta_files`
@@ -95,13 +120,21 @@ The file-manager tools operate **only** inside the Panjeta filesystem root:
   outright, absolute paths are accepted only when they resolve inside the
   root, and symlink escapes are detected by canonicalising the deepest
   existing ancestor of the target.
-* `read_file` reads plain text only (binary refused), truncated at 50 KB;
-  `list_directory` returns at most 200 entries.
+* `read_file` reads plain text only (binary refused), truncated at 50 KB.
+  `list_directory` returns at most 200 entries; an optional `recursive=true`
+  mode is depth-capped at 3 levels, entry-capped at 200, and never follows
+  symlinks (default is non-recursive).
 * `create_file` refuses to overwrite silently (`overwrite=true` required);
-  copy/move refuse to clobber existing destinations; parents are never
-  created automatically.
-* `delete_file` is destructive and requires an explicit `confirm=true`
-  argument; directories are refused (no recursive deletion).
+  copy/move refuse to clobber existing destinations; `create_directory`
+  creates only the requested directory (never a parent tree);
+  `move_directory` relocates a whole directory and refuses to move it into
+  itself or its own subtree.
+* **Destructive operations** (`delete_file`, `delete_directory`) require
+  BOTH the tool-level `confirm=true` argument AND real human approval at
+  the console: Panjeta prints e.g. `Delete 'notes/old.txt'? [y/N]` and only
+  an explicit `y`/`yes` proceeds — anything else, including blank input,
+  denies and nothing is touched. `delete_directory` deletes EMPTY
+  directories only; recursive deletion does not exist in Panjeta.
 
 Supported task examples (the LLM decides which tools to call — nothing is
 hard-coded in `main.py`):
@@ -112,7 +145,8 @@ Read notes/todo.txt.
 Create notes/today.txt with today's task list.
 Copy notes/a.txt to backup/a.txt.
 Rename notes/old.txt to notes/new.txt.
-Delete junk.txt.
+Create a folder called homework.
+Delete junk.txt.          ← Panjeta asks you [y/N] before deleting
 ```
 
 ### Provider selection
@@ -147,6 +181,19 @@ Optional filesystem sandbox configuration:
 PANJETA_FILE_ROOT=
 ```
 
+Optional session file location (conversation persistence):
+
+```dotenv
+# Default when unset: <project folder>/data/session.json (gitignored)
+PANJETA_SESSION_FILE=
+```
+
+Start with a clean conversation instead of restoring the previous one:
+
+```text
+python -m src.main --fresh-session
+```
+
 Manual real-API smoke scripts (not part of the automated suite):
 
 ```text
@@ -160,26 +207,33 @@ venv\Scripts\python.exe -m scripts.smoke_search <root> [query]
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**186 tests, all passing (offline, deterministic).** The providers are tested
-with scripted fakes and the filesystem tools run inside temporary sandbox
-directories — no API keys or network needed.
+**221 tests, all passing (offline, deterministic).** The providers are tested
+with scripted fakes, the filesystem tools run inside temporary sandbox
+directories, approval is tested with scripted approvers and stdin, and
+session persistence is tested against temporary JSON files — no API keys or
+network needed.
 
 ## ⚠️ Current Limitations
 
-* Agent memory is per-run only; nothing persists between runs.
-* Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design; they
-  handle **files only** — no directory creation/moving/deletion, no
-  binary/PDF/image content parsing, no search over file contents.
-* No approval UI yet: safety comes from explicit, validated tools and the
-  `delete_file` `confirm=true` requirement.
+* The session restores **recent conversation context only** (bounded at 200
+  messages; the oldest are dropped). This is persistent session state —
+  *not* long-term semantic memory and *not* human-like memory. No
+  summarization or embeddings exist.
+* Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design; there is
+  no binary/PDF/image content parsing and no search over file contents.
+* `delete_directory` deletes empty directories only; recursive deletion
+  does not exist anywhere in Panjeta.
+* Approval happens at the local console only (no remote/GUI approval), and
+  there is no per-tool permission configuration yet.
 * No web access, no WhatsApp, no OCR/PDF, no browser or GUI automation, and
   no arbitrary computer control.
 
 ## 🗺️ Direction
 
 Panjeta is being built toward a general-purpose local computer agent — but
-**this phase provides no arbitrary computer control**, only explicitly
-registered, validated tools. Next candidates: directory-level file-manager
-operations (create/move/delete directories, if justified), a real
-approval/permission layer for destructive operations, and persistent session
-memory — each behind the same `ToolRegistry`.
+**this project provides no arbitrary computer control**, only explicitly
+registered, validated tools behind the sandbox, the human-approval layer,
+and the registry. The foundation (sandbox + approval + sessions +
+`ToolRegistry`) is now in place for broader capabilities next: content-aware
+features (PDFs, images, WhatsApp-style documents), richer tool families,
+and configurable permissions — each added as a separate registered tool.

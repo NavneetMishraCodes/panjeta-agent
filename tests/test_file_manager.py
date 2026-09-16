@@ -20,9 +20,12 @@ from src.tools import (
     ToolRegistry,
     calculator_tool,
     copy_file_tool,
+    create_directory_tool,
     create_file_tool,
+    delete_directory_tool,
     delete_file_tool,
     list_directory_tool,
+    move_directory_tool,
     move_file_tool,
     read_file_tool,
     rename_file_tool,
@@ -496,6 +499,9 @@ class ToolDefinitionSchemaTest(FileManagerTestCase):
         (move_file_tool, "move_file", ["source", "destination"]),
         (rename_file_tool, "rename_file", ["source", "new_name"]),
         (delete_file_tool, "delete_file", ["path", "confirm"]),
+        (create_directory_tool, "create_directory", ["path"]),
+        (delete_directory_tool, "delete_directory", ["path", "confirm"]),
+        (move_directory_tool, "move_directory", ["source", "destination"]),
     )
 
     def test_all_tools_registered_with_valid_schemas(self):
@@ -527,6 +533,9 @@ class ToolDefinitionSchemaTest(FileManagerTestCase):
                 "move_file",
                 "rename_file",
                 "delete_file",
+                "create_directory",
+                "delete_directory",
+                "move_directory",
             },
         )
 
@@ -560,8 +569,9 @@ class AgentFileToolIntegrationTest(FileManagerTestCase):
 
     def _build(self):
         from src.agent import Agent
+        from src.approval import AutoApprover
 
-        registry = ToolRegistry()
+        registry = ToolRegistry(approver=AutoApprover())
         registry.register(calculator_tool())
         registry.register(search_files_tool())
         for factory, _, _ in ToolDefinitionSchemaTest.EXPECTED_TOOLS:

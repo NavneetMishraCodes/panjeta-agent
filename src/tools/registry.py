@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.approval import ApprovalDeniedError
 from src.llm.base import ToolDefinition
 from src.tools.base import Tool, ToolError
 
@@ -37,10 +38,18 @@ class ToolExecutionError(RuntimeError):
 
 
 class ToolRegistry:
-    """A simple, extensible registry mapping tool names to Tool instances."""
+    """A simple, extensible registry mapping tool names to Tool instances.
 
-    def __init__(self) -> None:
+    An optional ``Approver`` can be injected. Tools whose ``Tool`` is
+    marked ``requires_approval`` are only executed after the approver
+    explicitly approves; denial raises ``ApprovalDeniedError`` (a
+    ``ToolError``) so the Agent loop can report the denial to the model.
+    With no approver configured, approval-requiring tools are refused.
+    """
+
+    def __init__(self, approver=None) -> None:
         self._tools: dict[str, Tool] = {}
+        self._approver = approver
 
     def register(self, tool: Tool) -> None:
         """Register a tool under its name.
@@ -103,6 +112,8 @@ class ToolRegistry:
         Raises:
             ToolArgumentError: If `arguments` is not a dict.
             ToolNotFoundError: If no tool with `name` is registered.
+            ApprovalDeniedError: If the tool requires human approval and
+                the configured approver (or the absence of one) denies it.
             ToolError: If the tool rejects or cannot process the arguments.
             ToolExecutionError: If the tool fails unexpectedly (a bug).
         """
@@ -112,6 +123,7 @@ class ToolRegistry:
                 f"{type(arguments).__name__}."
             )
         tool = self.get(name)
+        self._require_approval_if_needed(tool, arguments)
         try:
             return tool.function(arguments)
         except ToolError:
@@ -120,3 +132,29 @@ class ToolRegistry:
             raise ToolExecutionError(
                 f"Tool {name!r} failed unexpectedly: {error}"
             ) from error
+
+    def _require_approval_if_needed(
+        self, tool: Tool, arguments: dict[str, Any]
+    ) -> None:
+        """Obtain human approval for destructive tools; default is DENY.
+
+        The LLM's own confirm flags are never treated as approval -- only
+        the injected ``Approver`` (the local user in interactive use) can
+        approve, and only an explicit affirmative counts.
+        """
+        if not tool.requires_approval:
+            return
+        if self._approver is None:
+            raise ApprovalDeniedError(
+                f"Tool {tool.name!r} requires human approval, but no "
+                "approver is configured. Nothing was executed."
+            )
+        if tool.approval_prompt is not None:
+            question = tool.approval_prompt(arguments)
+        else:
+            question = f"Allow tool {tool.name!r} to run?"
+        if not self._approver.approve(question):
+            raise ApprovalDeniedError(
+                f"The user did not approve this operation: {question} "
+                "Nothing was executed."
+            )

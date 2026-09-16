@@ -8,13 +8,20 @@ commands and never touch anything outside the root.
 
 Tool contracts (all return plain text results, raise ToolError on bad
 input, and are provider-independent):
-    * list_directory - bounded listing of one directory
-    * read_file      - bounded plain-text read (no binary/PDF parsing)
-    * create_file    - create a text file; refuses to overwrite silently
-    * copy_file      - copy a file (both paths validated)
-    * move_file      - move a file (both paths validated)
-    * rename_file    - rename within the same folder (unambiguous inputs)
-    * delete_file    - delete a file only; requires explicit confirm=true
+    * list_directory    - bounded listing of one directory; optional
+                          bounded recursive mode (depth- and entry-capped)
+    * read_file         - bounded plain-text read (no binary/PDF parsing)
+    * create_file       - create a text file; refuses to overwrite silently
+    * copy_file         - copy a file (both paths validated)
+    * move_file         - move a file (both paths validated)
+    * rename_file       - rename within the same folder (unambiguous inputs)
+    * delete_file       - delete a file only; requires confirm=true AND
+                          real human approval (registry approval layer)
+    * create_directory  - create one directory (no silent parent creation)
+    * delete_directory  - delete an EMPTY directory only; confirm=true AND
+                          human approval; never recursive
+    * move_directory    - move/relocate a whole directory (both paths
+                          validated, refuses to move into itself)
 """
 
 from __future__ import annotations
@@ -35,10 +42,16 @@ COPY_FILE_NAME = "copy_file"
 MOVE_FILE_NAME = "move_file"
 RENAME_FILE_NAME = "rename_file"
 DELETE_FILE_NAME = "delete_file"
+CREATE_DIRECTORY_NAME = "create_directory"
+DELETE_DIRECTORY_NAME = "delete_directory"
+MOVE_DIRECTORY_NAME = "move_directory"
 
 # Bounds that keep tool results from flooding the LLM context.
 MAX_LIST_ENTRIES = 200
 MAX_READ_BYTES = 50_000
+# Hard cap for recursive listings: at most this many directory levels below
+# the starting directory are included, regardless of what the model asks.
+MAX_RECURSIVE_DEPTH = 3
 
 FILE_ROOT_HINT = (
     "Relative to the Panjeta file root (PANJETA_FILE_ROOT); absolute "
@@ -119,7 +132,9 @@ LIST_DIRECTORY_DEFINITION = ToolDefinition(
     description=(
         "List the contents of one directory inside the Panjeta file root. "
         "Returns a bounded, sorted listing showing each entry's name, type "
-        "(file or folder), relative path, and size for files. Read-only."
+        "(file or folder), relative path, and size for files. Set "
+        "recursive=true for a nested listing that is depth-capped and "
+        "entry-capped. Read-only."
     ),
     parameters={
         "type": "object",
@@ -131,28 +146,67 @@ LIST_DIRECTORY_DEFINITION = ToolDefinition(
                     + FILE_ROOT_HINT
                 ),
             },
+            "recursive": {
+                "type": "boolean",
+                "description": (
+                    "Optional. When true, include subdirectory contents up "
+                    "to max_depth levels below the start directory "
+                    "(bounded; symlinks are never followed). Defaults to "
+                    "false (single directory only)."
+                ),
+            },
+            "max_depth": {
+                "type": "integer",
+                "description": (
+                    "Optional, recursive mode only: how many directory "
+                    "levels below the start to include (1-"
+                    + str(MAX_RECURSIVE_DEPTH)
+                    + "). Defaults to "
+                    + str(MAX_RECURSIVE_DEPTH)
+                    + "."
+                ),
+            },
         },
         "required": ["path"],
     },
 )
 
 
-def _list_directory(arguments: dict[str, Any]) -> str:
-    root = ensure_file_root()
-    display = _require_text(arguments, "path")
-    resolved = resolve_within_root(root, display, must_exist=True)
+def _optional_int(
+    arguments: dict[str, Any],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Fetch an optional bounded integer argument."""
+    value = arguments.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolError(f"Argument {key!r} must be an integer.")
+    if not minimum <= value <= maximum:
+        raise ToolError(
+            f"Argument {key!r} must be between {minimum} and {maximum}."
+        )
+    return value
 
-    if not resolved.is_dir():
-        raise ToolError(f"'{display}' is not a directory (it is a file).")
 
+def _scan_single(
+    directory: Path, root: Path, display: str
+) -> list[tuple[str, str, str, bool]]:
+    """Scan one directory into sorted ``(kind, name, detail, is_real_dir)``.
+
+    ``is_real_dir`` is False for symlinks (symlinked directories are shown
+    as directories but are never descended into during recursive listings).
+    """
     try:
-        entries = list(os.scandir(resolved))
+        with os.scandir(directory) as iterator:
+            entries = list(iterator)
     except OSError as error:
         raise ToolError(
             f"Cannot access directory '{display}': {error}"
         ) from error
 
-    records: list[tuple[str, str, str]] = []  # (kind, name, detail)
+    records: list[tuple[str, str, str, bool]] = []
     for entry in entries:
         path = Path(entry.path)
         try:
@@ -172,22 +226,89 @@ def _list_directory(arguments: dict[str, Any]) -> str:
             raise ToolError(
                 f"Cannot inspect entry '{entry.name}' in '{display}': {error}"
             ) from error
-        records.append((kind, entry.name, detail))
+        records.append((kind, entry.name, detail, entry.is_dir(follow_symlinks=False)))
 
     records.sort(key=lambda record: (record[0] != "dir", record[1].lower()))
-    total = len(records)
+    return records
 
+
+def _format_listing(
+    display: str,
+    groups: list[tuple[str, list]],
+    truncated: bool,
+    suffix: str = "",
+) -> str:
+    """Render listing groups; non-recursive output is a single group."""
+    total = sum(len(records) for _, records in groups)
     if total == 0:
         return f"Directory '{display}' is empty."
 
-    shown = records[:MAX_LIST_ENTRIES]
-    header = f"Directory '{display}' contains {total} item(s):"
-    if total > MAX_LIST_ENTRIES:
+    header = f"Directory '{display}' contains {total} item(s){suffix}:"
+    if truncated:
         header += f" (showing first {MAX_LIST_ENTRIES})"
     lines = [header, ""]
-    for index, (kind, name, detail) in enumerate(shown, start=1):
-        lines.append(f"{index}. [{kind:5}] {name}  ({detail})")
+
+    numbered = 0
+    for group_display, records in groups:
+        if len(groups) > 1:
+            lines.append(f"{group_display}/")
+        for record in records:
+            kind, name, detail = record[0], record[1], record[2]
+            numbered += 1
+            lines.append(f"{numbered}. [{kind:5}] {name}  ({detail})")
     return "\n".join(lines)
+
+
+def _list_directory(arguments: dict[str, Any]) -> str:
+    root = ensure_file_root()
+    display = _require_text(arguments, "path")
+    resolved = resolve_within_root(root, display, must_exist=True)
+
+    if not resolved.is_dir():
+        raise ToolError(f"'{display}' is not a directory (it is a file).")
+
+    recursive = _optional_flag(arguments, "recursive", default=False)
+    max_depth = MAX_RECURSIVE_DEPTH
+    suffix = ""
+    if recursive:
+        max_depth = _optional_int(
+            arguments,
+            "max_depth",
+            default=MAX_RECURSIVE_DEPTH,
+            minimum=1,
+            maximum=MAX_RECURSIVE_DEPTH,
+        )
+        suffix = f" (recursive, max depth {max_depth})"
+
+    if not recursive:
+        records = _scan_single(resolved, root, display)
+        truncated = len(records) > MAX_LIST_ENTRIES
+        records = records[:MAX_LIST_ENTRIES]
+        return _format_listing(display, [(display, records)], truncated)
+
+    # Bounded recursive walk: depth-capped, entry-capped, symlinks never
+    # followed, so the result can never flood the model context.
+    groups: list[tuple[str, list]] = []
+    state = {"total": 0, "truncated": False}
+
+    def walk(directory: Path, group_display: str, level: int) -> None:
+        if state["truncated"]:
+            return
+        records = _scan_single(directory, root, group_display)
+        remaining = MAX_LIST_ENTRIES - state["total"]
+        if len(records) > remaining:
+            records = records[:remaining]
+            state["truncated"] = True
+        groups.append((group_display, records))
+        state["total"] += len(records)
+        if state["truncated"] or level >= max_depth:
+            return
+        for record in records:
+            if record[3]:  # real directory only (never a symlink)
+                walk(directory / record[1], record[2], level + 1)
+
+    walk(resolved, display, 1)
+    return _format_listing(display, groups, state["truncated"], suffix)
 
 
 def list_directory_tool() -> Tool:
@@ -617,6 +738,254 @@ def _delete_file(arguments: dict[str, Any]) -> str:
     return f"Deleted file '{_relative(resolved, root)}'."
 
 
+def _delete_file_approval_prompt(arguments: dict[str, Any]) -> str:
+    """Build the human-facing question for deleting a file."""
+    path = arguments.get("path", "<unknown>")
+    return f"Delete file '{path}'?"
+
+
 def delete_file_tool() -> Tool:
-    """Return a fresh Tool instance wrapping delete_file."""
-    return Tool(definition=DELETE_FILE_DEFINITION, function=_delete_file)
+    """Return a fresh Tool instance wrapping delete_file.
+
+    The tool carries ``confirm=true`` in its schema so the model must
+    state its intent explicitly, but that flag is *not* approval: the
+    registry additionally asks the configured Approver (the local user)
+    before the deletion runs.
+    """
+    return Tool(
+        definition=DELETE_FILE_DEFINITION,
+        function=_delete_file,
+        requires_approval=True,
+        approval_prompt=_delete_file_approval_prompt,
+    )
+
+
+# ---------------------------------------------------------------------------
+# create_directory
+# ---------------------------------------------------------------------------
+
+CREATE_DIRECTORY_DEFINITION = ToolDefinition(
+    name=CREATE_DIRECTORY_NAME,
+    description=(
+        "Create a single new directory inside the Panjeta file root. "
+        "Fails safely if anything already exists at the target path or if "
+        "the parent directory does not exist. Parent directories are "
+        "never created automatically. Non-destructive."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "New directory to create. " + FILE_ROOT_HINT,
+            },
+        },
+        "required": ["path"],
+    },
+)
+
+
+def _create_directory(arguments: dict[str, Any]) -> str:
+    root = ensure_file_root()
+    display = _require_text(arguments, "path")
+    resolved = resolve_within_root(root, display)
+
+    if os.path.lexists(str(resolved)):
+        kind = "directory" if resolved.is_dir() else "file"
+        raise ToolError(
+            f"Cannot create directory '{display}': something already "
+            f"exists there ({kind}). Nothing was changed."
+        )
+
+    _require_parent_directory(resolved)
+
+    try:
+        resolved.mkdir()
+    except OSError as error:
+        raise ToolError(
+            f"Cannot create directory '{display}': {error}"
+        ) from error
+    return f"Created directory '{_relative(resolved, root)}'."
+
+
+def create_directory_tool() -> Tool:
+    """Return a fresh Tool instance wrapping create_directory."""
+    return Tool(definition=CREATE_DIRECTORY_DEFINITION, function=_create_directory)
+
+
+# ---------------------------------------------------------------------------
+# delete_directory
+# ---------------------------------------------------------------------------
+
+DELETE_DIRECTORY_DEFINITION = ToolDefinition(
+    name=DELETE_DIRECTORY_NAME,
+    description=(
+        "Delete an EMPTY directory inside the Panjeta file root. This is "
+        "a destructive operation: it requires confirm=true AND explicit "
+        "human approval, refuses directories that still contain anything "
+        "(there is no recursive deletion), and fails cleanly if the "
+        "target is missing or is a file."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Empty directory to delete. " + FILE_ROOT_HINT,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Must be exactly true to confirm deletion. Any other "
+                    "value aborts the operation."
+                ),
+            },
+        },
+        "required": ["path", "confirm"],
+    },
+)
+
+
+def _delete_directory(arguments: dict[str, Any]) -> str:
+    root = ensure_file_root()
+    display = _require_text(arguments, "path")
+    confirmed = _optional_flag(arguments, "confirm", default=False)
+    if confirmed is not True:
+        raise ToolError(
+            "Deletion is destructive and requires confirm=true. "
+            "Nothing was deleted."
+        )
+
+    resolved = resolve_within_root(root, display, must_exist=True)
+    if not resolved.is_dir():
+        raise ToolError(
+            f"Refusing to delete '{display}': it is not a directory."
+        )
+
+    try:
+        empty = not any(resolved.iterdir())
+    except OSError as error:
+        raise ToolError(
+            f"Cannot inspect directory '{display}': {error}"
+        ) from error
+    if not empty:
+        raise ToolError(
+            f"Refusing to delete '{display}': it is not empty. Recursive "
+            "deletion is not supported."
+        )
+
+    try:
+        resolved.rmdir()
+    except OSError as error:
+        raise ToolError(
+            f"Cannot delete directory '{display}': {error}"
+        ) from error
+    return f"Deleted empty directory '{_relative(resolved, root)}'."
+
+
+def _delete_directory_approval_prompt(arguments: dict[str, Any]) -> str:
+    """Build the human-facing question for deleting a directory."""
+    path = arguments.get("path", "<unknown>")
+    return f"Delete empty directory '{path}'?"
+
+
+def delete_directory_tool() -> Tool:
+    """Return a fresh Tool instance wrapping delete_directory.
+
+    Like ``delete_file``, the ``confirm=true`` argument only forces the
+    model to state its intent; real approval comes from the registry's
+    Approver (default DENY).
+    """
+    return Tool(
+        definition=DELETE_DIRECTORY_DEFINITION,
+        function=_delete_directory,
+        requires_approval=True,
+        approval_prompt=_delete_directory_approval_prompt,
+    )
+
+
+# ---------------------------------------------------------------------------
+# move_directory
+# ---------------------------------------------------------------------------
+
+MOVE_DIRECTORY_DEFINITION = ToolDefinition(
+    name=MOVE_DIRECTORY_NAME,
+    description=(
+        "Move an entire directory (with its contents) to a new location "
+        "inside the Panjeta file root. Both paths are validated against "
+        "the sandbox; the move refuses to relocate a directory into "
+        "itself or its own subtree, fails safely if the source is "
+        "missing, if the destination already exists, or if the "
+        "destination's parent directory does not exist."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": "Existing directory to move. " + FILE_ROOT_HINT,
+            },
+            "destination": {
+                "type": "string",
+                "description": (
+                    "Full target path for the directory (must not already "
+                    "exist). " + FILE_ROOT_HINT
+                ),
+            },
+        },
+        "required": ["source", "destination"],
+    },
+)
+
+
+def _move_directory(arguments: dict[str, Any]) -> str:
+    root = ensure_file_root()
+    source_display = _require_text(arguments, "source")
+    destination_display = _require_text(arguments, "destination")
+
+    source = resolve_within_root(root, source_display, must_exist=True)
+    if not source.is_dir():
+        raise ToolError(
+            f"'{source_display}' is not a directory; use move_file for "
+            "files."
+        )
+
+    destination = resolve_within_root(root, destination_display)
+    if os.path.lexists(str(destination)):
+        raise ToolError(
+            f"Destination already exists: '{destination_display}'. "
+            "Nothing was overwritten."
+        )
+    _require_parent_directory(destination)
+
+    # Refuse relocating a directory into itself or its own subtree: the
+    # destination must not be the source or live underneath it. Both paths
+    # are already canonical, so a prefix comparison is exact.
+    if destination == source or source in destination.parents:
+        raise ToolError(
+            f"Cannot move '{source_display}' into '{destination_display}': "
+            "the destination is the source directory or inside it."
+        )
+
+    try:
+        shutil.move(str(source), str(destination))
+    except OSError as error:
+        raise ToolError(
+            f"Cannot move directory '{source_display}' to "
+            f"'{destination_display}': {error}"
+        ) from error
+    return (
+        f"Moved directory '{_relative(source, root)}' to "
+        f"'{_relative(destination, root)}'."
+    )
+
+
+def move_directory_tool() -> Tool:
+    """Return a fresh Tool instance wrapping move_directory."""
+    return Tool(
+        definition=MOVE_DIRECTORY_DEFINITION,
+        function=_move_directory,
+    )
+
+
+# __DIR_CHUNK2__

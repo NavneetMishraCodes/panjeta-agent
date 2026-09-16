@@ -43,6 +43,9 @@ htmlcov/
 logs/
 *.log
 
+# --- Panjeta local session/state (generated) ---
+data/
+
 # --- Type checkers / linters ---
 .mypy_cache/
 .dmypy.json
