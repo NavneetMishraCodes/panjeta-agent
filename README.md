@@ -6,7 +6,10 @@
 
 ## 🚧 Status
 
-**Early development, working foundation.** Panjeta currently provides:
+**Early development, working foundation.** The core principle holds throughout:
+the **LLM is only the planner** — it requests actions — while Panjeta itself
+validates, approves, executes, observes, and remembers the work. Panjeta
+currently provides:
 
 * A provider-independent LLM abstraction (`BaseLLM`) with **two working
   providers**: OpenRouter (via the official `openai` SDK against OpenRouter's
@@ -220,7 +223,14 @@ PANJETA_SESSION_FILE=
 Start with a clean conversation instead of restoring the previous one:
 
 ```text
-python -m src.main --fresh-session
+python -m src.main --fresh-session        # or the alias: --fresh
+```
+
+Session controls (purely local commands — no provider, no API key needed):
+
+```text
+python -m src.main session status   # file path, format version, message count
+python -m src.main session reset    # delete the stored session file
 ```
 
 Manual real-API smoke scripts (not part of the automated suite):
