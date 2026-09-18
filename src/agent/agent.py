@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.llm.base import BaseLLM, LLMResponse, Message, ToolCall
+from src.session import DEFAULT_MAX_HISTORY_BYTES, bound_history
 from src.tools import (
     ToolArgumentError,
     ToolError,
@@ -210,8 +211,17 @@ class Agent:
         new_documents = _as_documents(history[prefix + restored :])
         merged = self._past_messages + new_documents
         self._store.save(merged)
-        # Mirror the store's own bound so repeated runs do not grow memory.
-        self._past_messages = merged[-self._store.max_messages :]
+        # Mirror the store's own bounds so repeated runs do not grow memory,
+        # and keep the mirrored window provider-valid: a plain slice can start
+        # on a tool result whose assistant tool_calls message was cut off,
+        # which a provider rejects on every following turn.
+        self._past_messages = bound_history(
+            merged,
+            max_messages=self._store.max_messages,
+            max_bytes=getattr(
+                self._store, "max_bytes", DEFAULT_MAX_HISTORY_BYTES
+            ),
+        )
 
     @staticmethod
     def _assistant_message(response: LLMResponse) -> Message:

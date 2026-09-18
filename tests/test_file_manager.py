@@ -34,6 +34,10 @@ from src.tools import (
 )
 from src.tools.paths import FILE_ROOT_ENV_VAR
 
+# Imported after src.tools: src.approval imports ToolError from
+# src.tools.base, so the tools package must initialize first.
+from src.approval import AutoApprover
+
 
 class FileManagerTestCase(unittest.TestCase):
     """Each test runs with a fresh temporary Panjeta file root."""
@@ -497,6 +501,211 @@ class DeleteFileTest(FileManagerTestCase):
     def test_missing_path_argument(self):
         with self.assertRaises(ToolError):
             delete_file_tool().function({"confirm": True})
+
+
+class CreateDirectoryTest(FileManagerTestCase):
+    def test_creates_one_directory(self):
+        result = create_directory_tool().function({"path": "notes"})
+        self.assertEqual(result, "Created directory 'notes'.")
+        self.assertTrue((self.root / "notes").is_dir())
+
+    def test_requires_an_existing_parent(self):
+        with self.assertRaises(ToolError) as ctx:
+            create_directory_tool().function({"path": "a/b"})
+        self.assertIn("Parent directory does not exist", str(ctx.exception))
+        self.assertFalse((self.root / "a").exists())
+
+    def test_existing_directory_is_refused_and_untouched(self):
+        (self.root / "notes").mkdir()
+        (self.root / "notes" / "keep.txt").write_text("keep")
+        with self.assertRaises(ToolError) as ctx:
+            create_directory_tool().function({"path": "notes"})
+        self.assertIn("already exists there (directory)", str(ctx.exception))
+        self.assertEqual(
+            (self.root / "notes" / "keep.txt").read_text(), "keep"
+        )
+
+    def test_existing_file_is_refused_and_untouched(self):
+        self.write("plain.txt", "data")
+        with self.assertRaises(ToolError) as ctx:
+            create_directory_tool().function({"path": "plain.txt"})
+        self.assertIn("already exists there (file)", str(ctx.exception))
+        self.assertEqual((self.root / "plain.txt").read_text(), "data")
+
+    def test_traversal_and_outside_paths_rejected(self):
+        with tempfile.TemporaryDirectory() as outside:
+            for bad in ("../evil", str(Path(outside) / "evil")):
+                with self.subTest(path=bad):
+                    with self.assertRaises(ToolError):
+                        create_directory_tool().function({"path": bad})
+            self.assertFalse((Path(outside) / "evil").exists())
+        self.assertFalse((self.root.parent / "evil").exists())
+
+    def test_absolute_path_inside_root_is_allowed(self):
+        result = create_directory_tool().function(
+            {"path": str(self.root / "abs")}
+        )
+        self.assertEqual(result, "Created directory 'abs'.")
+        self.assertTrue((self.root / "abs").is_dir())
+
+    def test_missing_path_argument(self):
+        with self.assertRaises(ToolError):
+            create_directory_tool().function({})
+
+    def test_is_not_approval_gated(self):
+        self.assertFalse(create_directory_tool().requires_approval)
+        self.assertIsNone(create_directory_tool().approval_condition)
+
+
+class DeleteDirectoryTest(FileManagerTestCase):
+    def test_deletes_an_empty_directory_with_confirm(self):
+        (self.root / "empty").mkdir()
+        result = delete_directory_tool().function(
+            {"path": "empty", "confirm": True}
+        )
+        self.assertEqual(result, "Deleted empty directory 'empty'.")
+        self.assertFalse((self.root / "empty").exists())
+
+    def test_unconfirmed_deletion_is_refused(self):
+        (self.root / "empty").mkdir()
+        cases = (
+            ({"path": "empty"}, "requires confirm=true"),
+            ({"path": "empty", "confirm": False}, "requires confirm=true"),
+            ({"path": "empty", "confirm": "true"}, "must be a boolean"),
+            ({"path": "empty", "confirm": 1}, "must be a boolean"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ToolError) as ctx:
+                    delete_directory_tool().function(arguments)
+                self.assertIn(expected, str(ctx.exception))
+                self.assertTrue((self.root / "empty").is_dir())
+
+    def test_non_empty_directory_is_refused(self):
+        self.write("full/keep.txt", "keep")
+        with self.assertRaises(ToolError) as ctx:
+            delete_directory_tool().function(
+                {"path": "full", "confirm": True}
+            )
+        self.assertIn("not empty", str(ctx.exception))
+        self.assertEqual(
+            (self.root / "full" / "keep.txt").read_text(), "keep"
+        )
+
+    def test_file_target_is_refused(self):
+        self.write("plain.txt", "data")
+        with self.assertRaises(ToolError) as ctx:
+            delete_directory_tool().function(
+                {"path": "plain.txt", "confirm": True}
+            )
+        self.assertIn("not a directory", str(ctx.exception))
+        self.assertTrue((self.root / "plain.txt").is_file())
+
+    def test_missing_target_is_a_clean_error(self):
+        with self.assertRaises(ToolError) as ctx:
+            delete_directory_tool().function(
+                {"path": "nope", "confirm": True}
+            )
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_missing_path_argument(self):
+        with self.assertRaises(ToolError):
+            delete_directory_tool().function({"confirm": True})
+
+    def test_requires_human_approval(self):
+        tool = delete_directory_tool()
+        self.assertTrue(tool.requires_approval)
+        self.assertTrue(callable(tool.approval_prompt))
+        self.assertIn("empty", tool.approval_prompt({"path": "old"}))
+
+
+class MoveDirectoryTest(FileManagerTestCase):
+    def test_moves_a_directory_with_its_contents(self):
+        self.write("projects/panjeta/notes.txt", "hello")
+        result = move_directory_tool().function(
+            {
+                "source": "projects/panjeta",
+                "destination": "projects/moved",
+            }
+        )
+        self.assertEqual(
+            result, "Moved directory 'projects/panjeta' to 'projects/moved'."
+        )
+        self.assertFalse((self.root / "projects" / "panjeta").exists())
+        self.assertEqual(
+            (self.root / "projects" / "moved" / "notes.txt").read_text(),
+            "hello",
+        )
+
+    def test_missing_source(self):
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function(
+                {"source": "nope", "destination": "other"}
+            )
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_file_source_is_rejected(self):
+        self.write("plain.txt", "data")
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function(
+                {"source": "plain.txt", "destination": "other"}
+            )
+        self.assertIn("use move_file", str(ctx.exception))
+
+    def test_existing_destination_is_refused_and_untouched(self):
+        self.write("a/one.txt", "one")
+        self.write("b/two.txt", "two")
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function({"source": "a", "destination": "b"})
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertEqual((self.root / "a" / "one.txt").read_text(), "one")
+        self.assertEqual((self.root / "b" / "two.txt").read_text(), "two")
+
+    def test_missing_destination_parent(self):
+        self.write("a/one.txt", "one")
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function(
+                {"source": "a", "destination": "missing/b"}
+            )
+        self.assertIn("Parent directory does not exist", str(ctx.exception))
+        self.assertTrue((self.root / "a" / "one.txt").is_file())
+
+    def test_cannot_move_into_itself_or_its_own_subtree(self):
+        self.write("a/one.txt", "one")
+        # The source itself already exists as the destination.
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function({"source": "a", "destination": "a"})
+        self.assertIn("already exists", str(ctx.exception))
+        # A not-yet-existing destination inside the source's own subtree.
+        with self.assertRaises(ToolError) as ctx:
+            move_directory_tool().function(
+                {"source": "a", "destination": "a/new"}
+            )
+        self.assertIn("inside it", str(ctx.exception))
+        self.assertTrue((self.root / "a" / "one.txt").is_file())
+        self.assertFalse((self.root / "a" / "new").exists())
+
+    def test_outside_destination_rejected_without_mutation(self):
+        self.write("a/one.txt", "one")
+        with tempfile.TemporaryDirectory() as outside:
+            with self.assertRaises(ToolError):
+                move_directory_tool().function(
+                    {
+                        "source": "a",
+                        "destination": str(Path(outside) / "a"),
+                    }
+                )
+            self.assertFalse((Path(outside) / "a").exists())
+        self.assertTrue((self.root / "a" / "one.txt").is_file())
+
+    def test_missing_arguments(self):
+        with self.assertRaises(ToolError):
+            move_directory_tool().function({"source": "a"})
+
+    def test_is_not_approval_gated(self):
+        tool = move_directory_tool()
+        self.assertFalse(tool.requires_approval)
+        self.assertIsNone(tool.approval_condition)
 
 
 class ToolDefinitionSchemaTest(FileManagerTestCase):
@@ -1083,6 +1292,156 @@ class SandboxEscapeRegressionTest(unittest.TestCase):
             (self.grandparent / "secret.txt").read_text(encoding="utf-8"),
             "outside-secret",
         )
+
+
+class ToolResultContractTest(FileManagerTestCase):
+    """Step 2 result contract: one predictable shape across every tool.
+
+    Tools return plain human-readable strings (the CLI/LLM-facing contract)
+    and raise ToolError with a non-empty message on bad input. This test
+    pins that contract across the whole registered tool set so no tool can
+    quietly drift into returning empty output, None, or raising raw
+    non-ToolError exceptions for ordinary bad input.
+    """
+
+    ALL_TOOLS = (
+        calculator_tool,
+        search_files_tool,
+        list_directory_tool,
+        read_file_tool,
+        create_file_tool,
+        copy_file_tool,
+        move_file_tool,
+        rename_file_tool,
+        delete_file_tool,
+        create_directory_tool,
+        delete_directory_tool,
+        move_directory_tool,
+    )
+
+    def _registry(self, approver="auto") -> ToolRegistry:
+        # Default: a test-only AutoApprover, so destructive calls still flow
+        # through the real approval gate (recorded in `asked`). Pass None for
+        # an approver-less registry, whose default policy is DENY.
+        registry = ToolRegistry(
+            approver=AutoApprover() if approver == "auto" else approver
+        )
+        for factory in self.ALL_TOOLS:
+            registry.register(factory())
+        return registry
+
+    def test_every_tool_has_schema_arguments_and_no_approval_gap(self):
+        for factory in self.ALL_TOOLS:
+            with self.subTest(tool=factory.__name__):
+                tool = factory()
+                self.assertTrue(tool.name)
+                self.assertTrue(tool.description)
+                self.assertIsInstance(tool.parameters, dict)
+                # Approval metadata is explicit: always-destructive tools set
+                # requires_approval with a prompt; sometimes-destructive ones
+                # (create_file overwrite=true) set an approval_condition.
+                if tool.requires_approval:
+                    self.assertTrue(callable(tool.approval_prompt))
+                    self.assertIsNone(tool.approval_condition)
+                elif tool.approval_condition is not None:
+                    self.assertTrue(callable(tool.approval_condition))
+                    self.assertTrue(callable(tool.approval_prompt))
+
+    def test_valid_calls_return_readable_nonempty_strings(self):
+        self.write("data/a.txt", "alpha")
+        self.write("data/b.txt", "beta")
+        (self.root / "empty_dir").mkdir()
+        registry = self._registry()
+        cases = (
+            ("calculator", {"expression": "2+2"}, "4"),
+            (
+                "search_files",
+                {"root": str(self.root), "query": "a.txt"},
+                "a.txt",
+            ),
+            ("list_directory", {"path": "data"}, "a.txt"),
+            ("read_file", {"path": "data/a.txt"}, "alpha"),
+            ("create_file", {"path": "data/c.txt", "content": "gamma"}, "Created"),
+            (
+                "copy_file",
+                {"source": "data/a.txt", "destination": "data/copy.txt"},
+                "Copied",
+            ),
+            (
+                "move_file",
+                {"source": "data/b.txt", "destination": "data/moved.txt"},
+                "Moved",
+            ),
+            (
+                "rename_file",
+                {"source": "data/moved.txt", "new_name": "renamed.txt"},
+                "Renamed",
+            ),
+            ("create_directory", {"path": "made_dir"}, "Created"),
+        )
+        for name, arguments, expected in cases:
+            with self.subTest(tool=name):
+                result = registry.execute(name, arguments)
+                self.assertIsInstance(result, str)
+                self.assertTrue(result.strip())
+                self.assertIn(expected, result)
+        # Destructive operations run only through the approval gate; here the
+        # test registry has an explicit (test-only) approver.
+        deleted = registry.execute(
+            "delete_file", {"path": "data/renamed.txt", "confirm": True}
+        )
+        self.assertIn("Deleted", deleted)
+        self.assertFalse((self.root / "data" / "renamed.txt").exists())
+        removed = registry.execute(
+            "delete_directory", {"path": "empty_dir", "confirm": True}
+        )
+        self.assertIn("Deleted", removed)
+        self.assertFalse((self.root / "empty_dir").exists())
+
+    def test_invalid_calls_raise_toolerror_with_nonempty_messages(self):
+        self.write("plain.txt", "x")
+        # No approver configured: destructive requests are refused at the
+        # approval gate (ApprovalDeniedError, a ToolError) before any side
+        # effect; other tools raise their own validation ToolErrors.
+        registry = self._registry(approver=None)
+        cases = (
+            ("calculator", {}),
+            ("read_file", {}),
+            ("read_file", {"path": "nope.txt"}),
+            ("copy_file", {"source": "plain.txt"}),
+            ("move_file", {"source": "nope.txt", "destination": "x.txt"}),
+            ("rename_file", {"source": "plain.txt"}),
+            ("delete_file", {"path": "plain.txt", "confirm": True}),
+            ("create_directory", {}),
+            ("delete_directory", {"path": "plain.txt", "confirm": True}),
+            ("move_directory", {"source": "plain.txt", "destination": "d"}),
+        )
+        for name, arguments in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                with self.assertRaises(ToolError) as ctx:
+                    registry.execute(name, arguments)
+                self.assertTrue(str(ctx.exception).strip())
+                self.assertNotIn("Traceback", str(ctx.exception))
+        # Nothing was created, moved, or destroyed by any rejected call.
+        self.assertEqual(
+            sorted(p.name for p in (self.root / ".").iterdir()), ["plain.txt"]
+        )
+        self.assertEqual((self.root / "plain.txt").read_text(encoding="utf-8"), "x")
+
+    def test_llm_arguments_cannot_become_code_or_approval(self):
+        registry = self._registry()
+        with self.assertRaises(ToolError):
+            registry.execute("calculator", {"expression": "__import__('os')"})
+        # A destructive request cannot be approved by the model itself: with
+        # no human approver configured, even confirm=true is denied and
+        # mutates nothing.
+        self.write("keep.txt", "keep")
+        denied_registry = self._registry(approver=None)
+        with self.assertRaises(ToolError):
+            denied_registry.execute(
+                "delete_file", {"path": "keep.txt", "confirm": True}
+            )
+        self.assertTrue((self.root / "keep.txt").is_file())
 
 
 if __name__ == "__main__":

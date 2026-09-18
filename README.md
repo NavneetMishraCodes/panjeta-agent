@@ -26,7 +26,11 @@
   console — `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text is
   never treated as approval.
 * **Persistent session state**: the interactive conversation is stored in a
-  bounded, versioned JSON file and restored on the next launch.
+  bounded, versioned JSON file and restored on the next launch. History is
+  capped by both message count and encoded size, corrupted or hand-edited
+  files degrade to a clean new session, and trimming can never leave a tool
+  result orphaned from its assistant tool call (pairing is repaired on
+  load and on every persisted turn).
 * **Hardened runtime (Phase 9)**: the filesystem sandbox cannot be escaped
   through `..`, absolute paths, the root's own ancestors, or symlink/junction
   redirects; provider failures (SDK errors, malformed payloads, unusable tool
@@ -232,7 +236,7 @@ venv\Scripts\python.exe -m scripts.smoke_search <root> [query]
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**302 tests, all passing offline and deterministically** (2 skipped, see
+**351 tests, all passing offline and deterministically** (2 skipped, see
 below). The providers are tested with scripted fakes, the filesystem tools
 run inside temporary sandbox directories, approval is tested with scripted
 approvers and stdin, and session persistence is tested against temporary JSON
@@ -259,7 +263,9 @@ actual link-helper bug fails the suite instead of silently skipping.
 ## ⚠️ Current Limitations
 
 * The session restores **recent conversation context only** (bounded at 200
-  messages; the oldest are dropped). This is persistent session state —
+  messages and 200,000 encoded bytes; the oldest are dropped, and a trimmed
+  window is repaired so tool calls/results always stay paired). This is
+  persistent session state —
   *not* long-term semantic memory and *not* human-like memory. No
   summarization or embeddings exist.
 * Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design; there is
