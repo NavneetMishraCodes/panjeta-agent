@@ -21,12 +21,18 @@
   `create_file`, `copy_file`, `move_file`, `rename_file`, `delete_file`,
   `create_directory`, `delete_directory`, `move_directory`) operating
   strictly inside a configurable filesystem sandbox (`PANJETA_FILE_ROOT`).
-* A **real human-approval layer**: destructive tools (the two deletions)
-  pause and ask the actual user at the console —
-  `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text is never
-  treated as approval.
+* A **real human-approval layer**: destructive tools (the two deletions, and
+  `create_file` with `overwrite=true`) pause and ask the actual user at the
+  console — `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text is
+  never treated as approval.
 * **Persistent session state**: the interactive conversation is stored in a
   bounded, versioned JSON file and restored on the next launch.
+* **Hardened runtime (Phase 9)**: the filesystem sandbox cannot be escaped
+  through `..`, absolute paths, the root's own ancestors, or symlink/junction
+  redirects; provider failures (SDK errors, malformed payloads, unusable tool
+  calls, empty answers) are reported as one clear local error and the
+  interactive session stays alive. All of it is covered by the offline suite,
+  including an end-to-end harness.
 
 **Not yet implemented** (documented goals only): long-term semantic memory
 (Panjeta restores recent conversation context, not human-like memory),
@@ -75,7 +81,11 @@ SessionStore.save  (bounded history restored on the next launch)
 
 * **`src/llm/base.py`** — provider-independent types (`Message`,
   `ToolDefinition`, `ToolCall`, `LLMResponse`), the `BaseLLM` interface, and
-  `LLMConfigError` (generic configuration failure shared by all providers).
+  the provider-independent failures all providers share: `LLMConfigError`
+  (bad configuration), `LLMRequestError` (an SDK/transport failure or a
+  malformed provider payload), and `LLMToolCallError` (a tool call that
+  cannot be normalized). Providers raise these at their own boundary and
+  scrub credentials from the text.
 * **`src/llm/openrouter.py`** — `OpenRouterLLM`: OpenAI-compatible adapter
   pointed at `https://openrouter.ai/api/v1`. Converts everything to/from the
   generic types inside the adapter.
@@ -86,7 +96,12 @@ SessionStore.save  (bounded history restored on the next launch)
 * **`src/llm/factory.py`** — `create_llm("openrouter" | "google")` —
   selects a provider without the Agent knowing which one it is talking to.
 * **`src/agent/agent.py`** — the `Agent` loop — provider-agnostic; it only
-  sees `BaseLLM` and `ToolRegistry`.
+  sees `BaseLLM` and `ToolRegistry`. A provider failure (SDK/transport
+  error, malformed response, unnormalizable tool call, or an empty answer)
+  is converted at this single boundary into one `AgentLLMError`, so the
+  interactive loop can report a clear error and keep running without the
+  core agent knowing which provider is configured. Nothing is persisted for
+  a failed turn.
 * **`src/tools/`** — `Tool` registry (`Tool`/`ToolRegistry`) with `calculator`
   (safe expression evaluator, no `eval`, injection-proof), `search_files`
   (read-only filename/metadata search, contents never read), and the
@@ -117,24 +132,34 @@ the Panjeta filesystem root:
   recommended). When unset, a safe default of `<project folder>/panjeta_files`
   is used (created on first use).
 * Every path is resolved against this root; `..` traversal is rejected
-  outright, absolute paths are accepted only when they resolve inside the
-  root, and symlink escapes are detected by canonicalising the deepest
-  existing ancestor of the target.
+  outright, absolute paths are accepted only when they resolve **inside** the
+  root, and the containment test never runs the other way round: the root's
+  own parent and grandparent (and anything else above the root) are rejected
+  for reads, listings, writes, and destinations alike.
+* Symlink **and** Windows junction escapes are caught by canonicalising the
+  existing prefix of the target and requiring the final resolved path to stay
+  inside the canonical root, so a link that points out of the sandbox is
+  refused even for a not-yet-existing destination. Directory walks never
+  descend into links (no cycles, no escapes).
 * `read_file` reads plain text only (binary refused), truncated at 50 KB.
   `list_directory` returns at most 200 entries; an optional `recursive=true`
   mode is depth-capped at 3 levels, entry-capped at 200, and never follows
   symlinks (default is non-recursive).
 * `create_file` refuses to overwrite silently (`overwrite=true` required);
-  copy/move refuse to clobber existing destinations; `create_directory`
+  `overwrite=true` is destructive, so it goes through the same human-approval
+  gate as deletions (`Overwrite file 'notes/old.txt'? [y/N]`, default deny).
+  Copy/move refuse to clobber existing destinations; `create_directory`
   creates only the requested directory (never a parent tree);
   `move_directory` relocates a whole directory and refuses to move it into
   itself or its own subtree.
-* **Destructive operations** (`delete_file`, `delete_directory`) require
-  BOTH the tool-level `confirm=true` argument AND real human approval at
-  the console: Panjeta prints e.g. `Delete 'notes/old.txt'? [y/N]` and only
-  an explicit `y`/`yes` proceeds — anything else, including blank input,
-  denies and nothing is touched. `delete_directory` deletes EMPTY
-  directories only; recursive deletion does not exist in Panjeta.
+* **Destructive operations** (`delete_file`, `delete_directory`, and
+  `create_file` with `overwrite=true`) require real human approval at the
+  console: Panjeta prints e.g. `Delete 'notes/old.txt'? [y/N]` and only an
+  explicit `y`/`yes` proceeds — anything else, including blank input, denies
+  and nothing is touched. The two deletions additionally require the
+  tool-level `confirm=true` argument, so the model has to state its intent.
+  `delete_directory` deletes EMPTY directories only; recursive deletion does
+  not exist in Panjeta.
 
 Supported task examples (the LLM decides which tools to call — nothing is
 hard-coded in `main.py`):
@@ -207,11 +232,29 @@ venv\Scripts\python.exe -m scripts.smoke_search <root> [query]
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**221 tests, all passing (offline, deterministic).** The providers are tested
-with scripted fakes, the filesystem tools run inside temporary sandbox
-directories, approval is tested with scripted approvers and stdin, and
-session persistence is tested against temporary JSON files — no API keys or
-network needed.
+**302 tests, all passing offline and deterministically** (2 skipped, see
+below). The providers are tested with scripted fakes, the filesystem tools
+run inside temporary sandbox directories, approval is tested with scripted
+approvers and stdin, and session persistence is tested against temporary JSON
+files — no API keys or network needed.
+
+The suite includes a permanent offline **end-to-end harness**
+(`tests/test_e2e.py`): a `ScriptedLLM` drives the real `Agent` → real
+`ToolRegistry` → real tools → a real temporary filesystem, covering the
+calculator, `search_files`, the whole file-manager family (create, read, copy,
+move, rename, delete, directory create/delete/move), an approved deletion, a
+denied deletion, provider-failure handling, and sandbox-boundary rejection.
+It verifies integration rather than replacing the unit tests.
+
+Sandbox-escape regressions live in `tests/test_paths.py` (path resolution) and
+`tests/test_file_manager.py` (`SandboxEscapeRegressionTest`, which also asserts
+that nothing outside the root was created, read, or changed).
+
+The two skips are the file-symlink tests on a machine whose platform does not
+grant the symlink privilege (Windows reports `WinError 1314`). Directory
+escape tests still run, using a junction fallback, and the skip is raised only
+for that genuine capability limit (a dedicated `LinkCapabilityError`), so an
+actual link-helper bug fails the suite instead of silently skipping.
 
 ## ⚠️ Current Limitations
 
@@ -221,6 +264,13 @@ network needed.
   summarization or embeddings exist.
 * Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design; there is
   no binary/PDF/image content parsing and no search over file contents.
+* `search_files` is intentionally **not** sandboxed: finding files the user
+  points it at anywhere on the computer is its purpose. It is read-only
+  (names and metadata only, links never followed) and bounded to
+  `MAX_SCANNED_ENTRIES` (50,000) entries per search, and the result says when
+  the scan stopped early. A search rooted at a very large tree can still take
+  noticeable time; a depth-limited walk/cancellation is a Phase 10
+  reliability item rather than a Phase 9 change.
 * `delete_directory` deletes empty directories only; recursive deletion
   does not exist anywhere in Panjeta.
 * Approval happens at the local console only (no remote/GUI approval), and

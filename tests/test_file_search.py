@@ -12,6 +12,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.tools import (
     SEARCH_FILES_NAME,
@@ -249,6 +250,30 @@ class SearchFilesSafetyTest(unittest.TestCase):
 
             self.assertIn("No matching files found", result)
             self.assertNotIn("outside_secret.txt", result)
+
+    def test_16_huge_tree_scan_is_bounded_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(60):
+                (root / f"file_{index:02d}.txt").write_text("x")
+            (root / "match_zzz.txt").write_text("y")
+
+            with mock.patch("src.tools.files.MAX_SCANNED_ENTRIES", 10):
+                result = _search(root, query="match", recursive=True)
+
+        self.assertIn("scan stopped after 10 entries", result)
+        self.assertIn("may be incomplete", result)
+
+    def test_16b_scan_note_is_absent_for_small_trees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "match.txt").write_text("x")
+            result = _search(root, query="match", recursive=True)
+        self.assertNotIn("scan stopped", result)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ from google.genai import types as genai_types
 
 from src.llm.base import (
     LLMConfigError,
+    LLMRequestError,
+    LLMToolCallError,
     BaseLLM,
     LLMResponse,
     Message,
@@ -34,6 +36,9 @@ from src.llm.base import (
 # Environment variable names used to configure this provider.
 API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 MODEL_ENV_VAR = "GOOGLE_MODEL"
+
+#: Longest provider error text kept in an LLMRequestError message.
+MAX_ERROR_DETAIL = 500
 
 # Maps JSON-Schema type names (as used by ToolDefinition.parameters) to the
 # type names the Gemini Schema object expects (OpenAPI 3.0 format).
@@ -52,7 +57,7 @@ class GoogleConfigError(LLMConfigError):
     """Raised when required Google configuration is missing."""
 
 
-class GoogleToolCallError(RuntimeError):
+class GoogleToolCallError(LLMToolCallError):
     """Raised when a Google function call cannot be normalized."""
 
 
@@ -87,7 +92,18 @@ class GoogleLLM(BaseLLM):
             )
 
         self._model = resolved_model
+        # Kept only so the credential can be scrubbed out of provider error
+        # text; it is never logged, printed, or exposed.
+        self._secret = resolved_key
         self._client = genai.Client(api_key=resolved_key)
+
+    def _sanitize(self, message: str) -> str:
+        """Remove the API key from provider-supplied error text."""
+        if self._secret and self._secret in message:
+            message = message.replace(self._secret, "[REDACTED]")
+        if len(message) > MAX_ERROR_DETAIL:
+            message = message[:MAX_ERROR_DETAIL] + "..."
+        return message
 
 
     def send_messages(
@@ -125,7 +141,15 @@ class GoogleLLM(BaseLLM):
         if config is not None:
             request_kwargs["config"] = config
 
-        response = self._client.models.generate_content(**request_kwargs)
+        try:
+            response = self._client.models.generate_content(**request_kwargs)
+        except Exception as error:  # noqa: BLE001 - provider boundary
+            # Any SDK/transport failure becomes a provider-independent request
+            # error so the Agent can report it without provider knowledge.
+            raise LLMRequestError(
+                "Google Gemini request failed "
+                f"({type(error).__name__}): {self._sanitize(str(error))}"
+            ) from error
         return self._to_llm_response(response)
 
     # --- Conversion: Panjeta Message list -> Gemini Content list ---------
@@ -260,9 +284,17 @@ class GoogleLLM(BaseLLM):
         if not candidates:
             return LLMResponse(content="", tool_calls=[], raw=response)
 
+        candidate_content = getattr(candidates[0], "content", None)
+        parts = getattr(candidate_content, "parts", None)
+        if not parts:
+            raise LLMRequestError(
+                "Google Gemini returned a response without usable content "
+                "(no text and no function calls)."
+            )
+
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        for part in candidates[0].content.parts:
+        for part in parts:
             function_call = getattr(part, "function_call", None)
             if function_call is not None:
                 tool_calls.append(GoogleLLM._normalize_function_call(function_call))

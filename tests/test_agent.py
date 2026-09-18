@@ -11,8 +11,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.agent import Agent, AgentMaximumIterationsError
-from src.llm.base import BaseLLM, LLMResponse, Message, ToolCall, ToolDefinition
+from src.agent import (
+    Agent,
+    AgentError,
+    AgentLLMError,
+    AgentMaximumIterationsError,
+)
+from src.llm.base import (
+    BaseLLM,
+    LLMRequestError,
+    LLMResponse,
+    LLMToolCallError,
+    Message,
+    ToolCall,
+    ToolDefinition,
+)
 from src.tools import ToolRegistry, calculator_tool, search_files_tool
 
 
@@ -393,6 +406,152 @@ class AgentFileSearchTest(unittest.TestCase):
             self.assertEqual(messages[2].tool_call_id, "s1")
             self.assertIn("math_notes.pdf", tool_result)
             self.assertNotIn("english_doc.docx", tool_result)
+
+
+class _FailingLLM(BaseLLM):
+    """BaseLLM whose request boundary always raises the given failure."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.calls = 0
+
+    def send_messages(self, messages, tools=None) -> LLMResponse:
+        self.calls += 1
+        raise self._error
+
+
+class _RecordingStore:
+    """Minimal SessionStore duck-type recording what the Agent persists."""
+
+    def __init__(self) -> None:
+        self.max_messages = 200
+        self.saved: list[list[dict]] = []
+
+    def load(self) -> list[dict]:
+        return []
+
+    def save(self, messages: list[dict]) -> None:
+        self.saved.append(list(messages))
+
+
+class AgentProviderFailureTest(unittest.TestCase):
+    """Provider failures must become one clean AgentLLMError, never a crash.
+
+    The Agent talks only to BaseLLM, so a provider RuntimeError, an SDK/API
+    failure, a malformed provider response, an unusable tool call, and an
+    empty response all have to reach the caller as the same
+    provider-independent error, with a readable message and nothing persisted
+    for the failed turn. Nothing here knows about OpenRouter or Gemini.
+    """
+
+    def _agent_for(self, error: BaseException) -> Agent:
+        return Agent(
+            llm=_FailingLLM(error), registry=_registry_with_calculator()
+        )
+
+    def test_provider_runtime_error_becomes_agent_llm_error(self):
+        agent = self._agent_for(RuntimeError("provider exploded"))
+        with self.assertRaises(AgentLLMError) as ctx:
+            agent.run("hello")
+        self.assertIn("RuntimeError", str(ctx.exception))
+        self.assertIn("provider exploded", str(ctx.exception))
+
+    def test_provider_sdk_failure_becomes_agent_llm_error(self):
+        class APIConnectionError(Exception):
+            """Stands in for an SDK transport failure."""
+
+        agent = self._agent_for(APIConnectionError("connection reset"))
+        with self.assertRaises(AgentLLMError) as ctx:
+            agent.run("hello")
+        self.assertIn("APIConnectionError", str(ctx.exception))
+        self.assertIn("connection reset", str(ctx.exception))
+
+    def test_malformed_tool_call_json_becomes_agent_llm_error(self):
+        agent = self._agent_for(
+            LLMToolCallError(
+                "Failed to parse JSON arguments for tool call 'c1' "
+                "(search_files): Expecting value"
+            )
+        )
+        with self.assertRaises(AgentLLMError):
+            agent.run("hello")
+
+    def test_missing_tool_call_structure_becomes_agent_llm_error(self):
+        agent = self._agent_for(
+            LLMToolCallError(
+                "Tool call 'c1' (calculator) arguments parsed to list, "
+                "expected a JSON object."
+            )
+        )
+        with self.assertRaises(AgentLLMError):
+            agent.run("hello")
+
+    def test_malformed_provider_payload_becomes_agent_llm_error(self):
+        agent = self._agent_for(
+            LLMRequestError(
+                "OpenRouter returned a response without any choices."
+            )
+        )
+        with self.assertRaises(AgentLLMError):
+            agent.run("hello")
+
+    def test_empty_response_is_not_reported_as_a_success(self):
+        class EmptyLLM(BaseLLM):
+            def send_messages(self, messages, tools=None) -> LLMResponse:
+                return LLMResponse(content="", tool_calls=[])
+
+        agent = Agent(llm=EmptyLLM(), registry=_registry_with_calculator())
+        with self.assertRaises(AgentLLMError) as ctx:
+            agent.run("hello")
+        self.assertIn("no usable content", str(ctx.exception))
+
+    def test_whitespace_only_response_is_not_reported_as_a_success(self):
+        class BlankLLM(BaseLLM):
+            def send_messages(self, messages, tools=None) -> LLMResponse:
+                return LLMResponse(content="  \n ", tool_calls=[])
+
+        agent = Agent(llm=BlankLLM(), registry=_registry_with_calculator())
+        with self.assertRaises(AgentLLMError):
+            agent.run("hello")
+
+    def test_already_normalized_agent_errors_pass_through(self):
+        agent = self._agent_for(AgentLLMError("already normalized"))
+        with self.assertRaises(AgentLLMError) as ctx:
+            agent.run("hello")
+        self.assertEqual(str(ctx.exception), "already normalized")
+        self.assertIsInstance(ctx.exception, AgentError)
+
+    def test_error_text_is_bounded(self):
+        agent = self._agent_for(RuntimeError("boom" * 1000))
+        with self.assertRaises(AgentLLMError) as ctx:
+            agent.run("hello")
+        self.assertLessEqual(len(str(ctx.exception)), 600)
+        self.assertIn("RuntimeError", str(ctx.exception))
+
+    def test_nothing_is_persisted_after_a_provider_failure(self):
+        store = _RecordingStore()
+        agent = Agent(
+            llm=_FailingLLM(RuntimeError("boom")),
+            registry=_registry_with_calculator(),
+            store=store,
+        )
+        with self.assertRaises(AgentLLMError):
+            agent.run("hello")
+        self.assertEqual(
+            store.saved, [], "a failed turn must persist nothing"
+        )
+
+    def test_successful_turn_is_still_persisted(self):
+        # Control for the test above: a successful turn really does persist,
+        # so "nothing saved" is a meaningful assertion about failure.
+        store = _RecordingStore()
+        agent = Agent(
+            llm=FakeLLM(scripted=[LLMResponse(content="fine")]),
+            registry=_registry_with_calculator(),
+            store=store,
+        )
+        agent.run("hello")
+        self.assertEqual(len(store.saved), 1)
 
 
 if __name__ == "__main__":

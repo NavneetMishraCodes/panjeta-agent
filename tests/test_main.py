@@ -102,5 +102,38 @@ class MainConfigErrorTest(unittest.TestCase):
         self.assertIn("Configuration error: missing api key", err.getvalue())
 
 
+class InteractiveProviderFailureTest(unittest.TestCase):
+    """A provider failure is reported locally and the session stays alive."""
+
+    def test_failure_is_reported_and_the_next_turn_still_works(self):
+        class RecoveringLLM(BaseLLM):
+            """Fails the first request, then answers normally."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def send_messages(self, messages, tools=None) -> LLMResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("upstream provider exploded")
+                return LLMResponse(content="recovered")
+
+        llm = RecoveringLLM()
+        agent = Agent(llm=llm, registry=ToolRegistry())
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch(
+            "builtins.input", side_effect=["first", "second", "quit"]
+        ):
+            code = run_interactive(agent)
+        rendered = out.getvalue()
+        self.assertEqual(code, 0)
+        # The user sees a clear, local error...
+        self.assertIn("Panjeta: The LLM provider failed", rendered)
+        self.assertIn("RuntimeError", rendered)
+        # ...and the process keeps going: the next turn really ran.
+        self.assertIn("Panjeta: recovered", rendered)
+        self.assertEqual(llm.calls, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

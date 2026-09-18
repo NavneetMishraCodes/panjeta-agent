@@ -11,7 +11,9 @@ input, and are provider-independent):
     * list_directory    - bounded listing of one directory; optional
                           bounded recursive mode (depth- and entry-capped)
     * read_file         - bounded plain-text read (no binary/PDF parsing)
-    * create_file       - create a text file; refuses to overwrite silently
+    * create_file       - create a text file; refuses to overwrite silently,
+                          and an explicit overwrite (overwrite=true) requires
+                          real human approval
     * copy_file         - copy a file (both paths validated)
     * move_file         - move a file (both paths validated)
     * rename_file       - rename within the same folder (unambiguous inputs)
@@ -26,6 +28,7 @@ input, and are provider-independent):
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -33,7 +36,7 @@ from typing import Any
 
 from src.llm.base import ToolDefinition
 from src.tools.base import Tool, ToolError
-from src.tools.paths import ensure_file_root, resolve_within_root
+from src.tools.paths import ensure_file_root, is_link_like, resolve_within_root
 
 LIST_DIRECTORY_NAME = "list_directory"
 READ_FILE_NAME = "read_file"
@@ -86,6 +89,35 @@ def _optional_flag(
     value = arguments.get(key, default)
     if not isinstance(value, bool):
         raise ToolError(f"Argument {key!r} must be a boolean.")
+    return value
+
+
+#: Result formats tools may offer. "text" is the human/CLI view; "json" is a
+#: machine-readable representation the LLM can chain on more reliably.
+TEXT_FORMAT = "text"
+JSON_FORMAT = "json"
+RESULT_FORMATS = frozenset({TEXT_FORMAT, JSON_FORMAT})
+
+FORMAT_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Optional result format. 'text' (default) returns the human-readable "
+        "view; 'json' returns a machine-readable JSON document with the same "
+        "information and the same bounds. "
+    ),
+    "enum": [TEXT_FORMAT, JSON_FORMAT],
+}
+
+
+def _optional_result_format(
+    arguments: dict[str, Any], default: str = TEXT_FORMAT
+) -> str:
+    """Fetch the optional result-format argument."""
+    value = arguments.get("format", default)
+    if value not in RESULT_FORMATS:
+        raise ToolError(
+            "Argument 'format' must be one of: text, json."
+        )
     return value
 
 
@@ -166,6 +198,7 @@ LIST_DIRECTORY_DEFINITION = ToolDefinition(
                     + "."
                 ),
             },
+            "format": dict(FORMAT_PROPERTY),
         },
         "required": ["path"],
     },
@@ -195,8 +228,9 @@ def _scan_single(
 ) -> list[tuple[str, str, str, bool]]:
     """Scan one directory into sorted ``(kind, name, detail, is_real_dir)``.
 
-    ``is_real_dir`` is False for symlinks (symlinked directories are shown
-    as directories but are never descended into during recursive listings).
+    ``is_real_dir`` is False for links (symlinks and Windows junctions are
+    shown as directories but are never descended into during recursive
+    listings).
     """
     try:
         with os.scandir(directory) as iterator:
@@ -226,7 +260,15 @@ def _scan_single(
             raise ToolError(
                 f"Cannot inspect entry '{entry.name}' in '{display}': {error}"
             ) from error
-        records.append((kind, entry.name, detail, entry.is_dir(follow_symlinks=False)))
+        records.append(
+            (
+                kind,
+                entry.name,
+                detail,
+                entry.is_dir(follow_symlinks=False)
+                and not is_link_like(path),
+            )
+        )
 
     records.sort(key=lambda record: (record[0] != "dir", record[1].lower()))
     return records
@@ -267,6 +309,7 @@ def _list_directory(arguments: dict[str, Any]) -> str:
     if not resolved.is_dir():
         raise ToolError(f"'{display}' is not a directory (it is a file).")
 
+    output_format = _optional_result_format(arguments)
     recursive = _optional_flag(arguments, "recursive", default=False)
     max_depth = MAX_RECURSIVE_DEPTH
     suffix = ""
@@ -284,31 +327,55 @@ def _list_directory(arguments: dict[str, Any]) -> str:
         records = _scan_single(resolved, root, display)
         truncated = len(records) > MAX_LIST_ENTRIES
         records = records[:MAX_LIST_ENTRIES]
-        return _format_listing(display, [(display, records)], truncated)
+        groups: list[tuple[str, list]] = [(display, records)]
+        total = len(records)
+    else:
+        # Bounded recursive walk: depth-capped, entry-capped, symlinks never
+        # followed, so the result can never flood the model context.
+        groups = []
+        state = {"total": 0, "truncated": False}
 
-    # Bounded recursive walk: depth-capped, entry-capped, symlinks never
-    # followed, so the result can never flood the model context.
-    groups: list[tuple[str, list]] = []
-    state = {"total": 0, "truncated": False}
+        def walk(directory: Path, group_display: str, level: int) -> None:
+            if state["truncated"]:
+                return
+            records = _scan_single(directory, root, group_display)
+            remaining = MAX_LIST_ENTRIES - state["total"]
+            if len(records) > remaining:
+                records = records[:remaining]
+                state["truncated"] = True
+            groups.append((group_display, records))
+            state["total"] += len(records)
+            if state["truncated"] or level >= max_depth:
+                return
+            for record in records:
+                if record[3]:  # real directory only (never a symlink)
+                    walk(directory / record[1], record[2], level + 1)
 
-    def walk(directory: Path, group_display: str, level: int) -> None:
-        if state["truncated"]:
-            return
-        records = _scan_single(directory, root, group_display)
-        remaining = MAX_LIST_ENTRIES - state["total"]
-        if len(records) > remaining:
-            records = records[:remaining]
-            state["truncated"] = True
-        groups.append((group_display, records))
-        state["total"] += len(records)
-        if state["truncated"] or level >= max_depth:
-            return
-        for record in records:
-            if record[3]:  # real directory only (never a symlink)
-                walk(directory / record[1], record[2], level + 1)
+        walk(resolved, display, 1)
+        total = state["total"]
+        truncated = state["truncated"]
 
-    walk(resolved, display, 1)
-    return _format_listing(display, groups, state["truncated"], suffix)
+    if output_format == JSON_FORMAT:
+        document = {
+            "directory": display,
+            "recursive": recursive,
+            "max_depth": max_depth,
+            "total": total,
+            "truncated": truncated,
+            "entries": [
+                {
+                    "name": record[1],
+                    "kind": record[0],
+                    "detail": record[2],
+                    "directory": group_display,
+                }
+                for group_display, records in groups
+                for record in records
+            ],
+        }
+        return json.dumps(document, ensure_ascii=False, indent=2)
+
+    return _format_listing(display, groups, truncated, suffix)
 
 
 def list_directory_tool() -> Tool:
@@ -335,6 +402,7 @@ READ_FILE_DEFINITION = ToolDefinition(
                 "type": "string",
                 "description": "Text file to read. " + FILE_ROOT_HINT,
             },
+            "format": dict(FORMAT_PROPERTY),
         },
         "required": ["path"],
     },
@@ -344,6 +412,7 @@ READ_FILE_DEFINITION = ToolDefinition(
 def _read_file(arguments: dict[str, Any]) -> str:
     root = ensure_file_root()
     display = _require_text(arguments, "path")
+    output_format = _optional_result_format(arguments)
     resolved = resolve_within_root(root, display, must_exist=True)
     _require_existing_file(resolved, display)
 
@@ -361,10 +430,18 @@ def _read_file(arguments: dict[str, Any]) -> str:
     total = len(data)
     truncated = total > MAX_READ_BYTES
     text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")
+    relative = _relative(resolved, root)
 
-    header = (
-        f"Contents of '{_relative(resolved, root)}' ({total} bytes):"
-    )
+    if output_format == JSON_FORMAT:
+        document = {
+            "path": relative,
+            "bytes": total,
+            "truncated": truncated,
+            "content": text,
+        }
+        return json.dumps(document, ensure_ascii=False, indent=2)
+
+    header = f"Contents of '{relative}' ({total} bytes):"
     if truncated:
         header += (
             f" [showing first {MAX_READ_BYTES} bytes; file truncated]"
@@ -386,9 +463,9 @@ CREATE_FILE_DEFINITION = ToolDefinition(
     description=(
         "Create a new text file inside the Panjeta file root and write "
         "content to it. Fails safely if the file already exists (pass "
-        "overwrite=true to deliberately replace it) or if the parent "
-        "directory does not exist. Parent directories are never created "
-        "automatically."
+        "overwrite=true to deliberately replace it, which requires human "
+        "approval) or if the parent directory does not exist. Parent "
+        "directories are never created automatically."
     ),
     parameters={
         "type": "object",
@@ -422,7 +499,8 @@ def _create_file(arguments: dict[str, Any]) -> str:
 
     resolved = resolve_within_root(root, display)
 
-    if os.path.lexists(str(resolved)):
+    existed = os.path.lexists(str(resolved))
+    if existed:
         if resolved.is_dir():
             raise ToolError(
                 f"Cannot create file '{display}': the path is an "
@@ -445,15 +523,46 @@ def _create_file(arguments: dict[str, Any]) -> str:
         ) from error
 
     written = len(content.encode("utf-8"))
-    mode = "Replaced" if overwrite and os.path.lexists(str(resolved)) else "Created"
+    mode = "Replaced" if existed else "Created"
     return (
         f"{mode} file '{_relative(resolved, root)}' ({written} bytes written)."
     )
 
 
+def _overwrite_requested(arguments: dict[str, Any]) -> bool:
+    """Whether this create_file call asked to replace existing content.
+
+    Used as the tool's approval *condition*: a plain create never prompts,
+    while ``overwrite=true`` always goes through the human approval gate --
+    even before the target's existence is known, so the decision cannot race
+    with the filesystem.
+    """
+    return arguments.get("overwrite") is True
+
+
+def _create_file_approval_prompt(arguments: dict[str, Any]) -> str:
+    """Build the human-facing question for replacing a file's contents."""
+    path = arguments.get("path", "<unknown>")
+    return (
+        f"Overwrite file '{path}'? If it already exists, its current "
+        "contents will be lost."
+    )
+
+
 def create_file_tool() -> Tool:
-    """Return a fresh Tool instance wrapping create_file."""
-    return Tool(definition=CREATE_FILE_DEFINITION, function=_create_file)
+    """Return a fresh Tool instance wrapping create_file.
+
+    The tool refuses to overwrite by default, and ``overwrite=true`` is
+    destructive, so it goes through the registry's approval gate: the
+    condition below asks the configured Approver (the local user) before an
+    existing file's contents are replaced. A plain create never prompts.
+    """
+    return Tool(
+        definition=CREATE_FILE_DEFINITION,
+        function=_create_file,
+        approval_condition=_overwrite_requested,
+        approval_prompt=_create_file_approval_prompt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +1095,3 @@ def move_directory_tool() -> Tool:
         definition=MOVE_DIRECTORY_DEFINITION,
         function=_move_directory,
     )
-
-
-# __DIR_CHUNK2__

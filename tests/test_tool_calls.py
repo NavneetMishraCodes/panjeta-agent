@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
-from src.llm.base import LLMResponse, Message, ToolCall
-from src.llm.openrouter import OpenRouterLLM, OpenRouterToolCallError
+from src.llm.base import LLMRequestError, LLMResponse, Message, ToolCall
+from src.llm.openrouter import (
+    MAX_ERROR_DETAIL,
+    OpenRouterLLM,
+    OpenRouterToolCallError,
+)
 
 
 def _completion(message: SimpleNamespace) -> SimpleNamespace:
@@ -146,6 +151,27 @@ class OpenRouterMessageConversionTest(unittest.TestCase):
             OpenRouterLLM._to_openai_message(message),
             {"role": "assistant", "content": "plain"},
         )
+
+
+class ProviderErrorSanitizationTest(unittest.TestCase):
+    """Provider error text must never carry the API key to the user."""
+
+    SECRET = "sk-or-v1-SUPERSECRET-123"
+
+    def test_sdk_failure_is_redacted_and_bounded(self):
+        llm = OpenRouterLLM(api_key=self.SECRET, model="test/model")
+        boom = RuntimeError(
+            f"401 Unauthorized for key {self.SECRET}: " + "x" * 5000
+        )
+        with mock.patch.object(
+            llm._client.chat.completions, "create", side_effect=boom
+        ):
+            with self.assertRaises(LLMRequestError) as ctx:
+                llm.send_messages([Message(role="user", content="hi")])
+        message = str(ctx.exception)
+        self.assertNotIn(self.SECRET, message)
+        self.assertIn("[REDACTED]", message)
+        self.assertLessEqual(len(message), MAX_ERROR_DETAIL + 200)
 
 
 if __name__ == "__main__":

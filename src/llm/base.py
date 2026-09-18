@@ -29,6 +29,26 @@ class LLMConfigError(RuntimeError):
     """
 
 
+class LLMRequestError(RuntimeError):
+    """Raised when a provider cannot produce a usable response.
+
+    Providers raise this from their request boundary -- an SDK/transport
+    failure, a malformed provider payload, or an unusable tool call -- so
+    callers (the Agent in particular) can report a provider problem without
+    knowing which provider is in use. Messages must never contain
+    credentials.
+    """
+
+
+class LLMToolCallError(LLMRequestError):
+    """Raised when a tool call in a provider response cannot be normalized.
+
+    Extends :class:`LLMRequestError` so callers can treat every provider
+    response problem uniformly, while still being able to distinguish a
+    malformed tool call (for example arguments that are not JSON).
+    """
+
+
 @dataclass
 class Message:
     """A single message exchanged with an LLM.

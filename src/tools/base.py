@@ -36,6 +36,11 @@ class Tool:
     # approval -- they only force the model to state its intent explicitly.
     requires_approval: bool = False
     approval_prompt: Callable[[dict[str, Any]], str] | None = None
+    # Optional finer-grained gate for tools that are only sometimes
+    # destructive (create_file with overwrite=true): consulted when
+    # requires_approval is False, and a condition that raises is treated as
+    # "approval required" so a broken predicate can never bypass the gate.
+    approval_condition: Callable[[dict[str, Any]], bool] | None = None
 
     @property
     def name(self) -> str:

@@ -42,9 +42,11 @@ class ToolRegistry:
 
     An optional ``Approver`` can be injected. Tools whose ``Tool`` is
     marked ``requires_approval`` are only executed after the approver
-    explicitly approves; denial raises ``ApprovalDeniedError`` (a
-    ``ToolError``) so the Agent loop can report the denial to the model.
-    With no approver configured, approval-requiring tools are refused.
+    explicitly approves; a tool may also declare an ``approval_condition``
+    for calls that are only sometimes destructive (create_file with
+    overwrite=true). Denial raises ``ApprovalDeniedError`` (a ``ToolError``)
+    so the Agent loop can report the denial to the model. With no approver
+    configured, approval-requiring tools are refused.
     """
 
     def __init__(self, approver=None) -> None:
@@ -142,7 +144,7 @@ class ToolRegistry:
         the injected ``Approver`` (the local user in interactive use) can
         approve, and only an explicit affirmative counts.
         """
-        if not tool.requires_approval:
+        if not self._needs_approval(tool, arguments):
             return
         if self._approver is None:
             raise ApprovalDeniedError(
@@ -158,3 +160,22 @@ class ToolRegistry:
                 f"The user did not approve this operation: {question} "
                 "Nothing was executed."
             )
+
+    @staticmethod
+    def _needs_approval(tool: Tool, arguments: dict[str, Any]) -> bool:
+        """Whether this *specific* call must be approved by a human.
+
+        ``requires_approval`` gates the tool as a whole. ``approval_condition``
+        adds an optional per-call gate for tools that are only destructive in
+        some invocations (create_file with overwrite=true). A condition that
+        raises counts as "approval required", so a failing predicate can never
+        open a bypass.
+        """
+        if tool.requires_approval:
+            return True
+        if tool.approval_condition is None:
+            return False
+        try:
+            return bool(tool.approval_condition(arguments))
+        except Exception:  # noqa: BLE001 - fail closed, never bypass
+            return True

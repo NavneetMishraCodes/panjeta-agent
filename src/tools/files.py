@@ -17,9 +17,16 @@ from typing import Any
 
 from src.llm.base import ToolDefinition
 from src.tools.base import Tool, ToolError
+from src.tools.paths import is_link_like
 
 SEARCH_FILES_NAME = "search_files"
 MAX_RESULTS = 50
+#: Safety bound: one search never inspects more than this many filesystem
+#: entries, so a search rooted at a very large tree (a whole drive, for
+#: example) cannot run away with time and memory. The result says when the
+#: scan stopped early, so a truncated search is never mistaken for a
+#: complete one.
+MAX_SCANNED_ENTRIES = 50_000
 
 SEARCH_FILES_DEFINITION = ToolDefinition(
     name=SEARCH_FILES_NAME,
@@ -28,8 +35,10 @@ SEARCH_FILES_DEFINITION = ToolDefinition(
         "find files whose filenames contain the query (case-insensitive "
         "substring match). Optionally filter by file extension and choose "
         "whether to also search nested folders. Returns up to 50 matches "
-        "with path, size, and modification time. Read-only: file contents "
-        "are never read or sent anywhere."
+        "with path, size, and modification time; a very large tree is "
+        "scanned up to a fixed safety limit and the result says so. "
+        "Directory links are never followed. Read-only: file contents are "
+        "never read or sent anywhere."
     ),
     parameters={
         "type": "object",
@@ -130,16 +139,23 @@ def _validate_arguments(
     return root.strip(), query.strip(), normalized_extension, recursive
 
 
-def _collect_candidates(root_path: Path, recursive: bool) -> list[Path]:
+def _collect_candidates(
+    root_path: Path, recursive: bool
+) -> tuple[list[Path], bool]:
     """Walk the root; raise ToolError on any unreadable directory.
 
-    Directory symlinks are not followed, so symlink cycles cannot cause
-    unbounded traversal.
+    Returns ``(candidates, truncated)``. A directory link (symlink or Windows
+    junction) is recorded but never followed, so links cannot lead the walk
+    out of the requested tree or around a cycle, and the walk stops after
+    ``MAX_SCANNED_ENTRIES`` entries so a huge tree cannot run away.
     """
 
     candidates: list[Path] = []
+    state = {"truncated": False}
 
     def visit(directory: Path) -> None:
+        if state["truncated"]:
+            return
         try:
             entries = list(os.scandir(directory))
         except OSError as error:
@@ -147,6 +163,9 @@ def _collect_candidates(root_path: Path, recursive: bool) -> list[Path]:
                 f"Cannot access directory {str(directory)!r}: {error}"
             ) from error
         for entry in entries:
+            if len(candidates) >= MAX_SCANNED_ENTRIES:
+                state["truncated"] = True
+                return
             path = Path(entry.path)
             candidates.append(path)
             try:
@@ -155,11 +174,22 @@ def _collect_candidates(root_path: Path, recursive: bool) -> list[Path]:
                 raise ToolError(
                     f"Cannot inspect entry {str(path)!r}: {error}"
                 ) from error
-            if recursive and is_directory:
+            if recursive and is_directory and not is_link_like(path):
                 visit(path)
 
     visit(root_path)
-    return candidates
+    return candidates, state["truncated"]
+
+
+def _scan_note(scan_truncated: bool) -> str:
+    """Warn when the walk stopped early, so a partial result is never
+    mistaken for a complete one."""
+    if not scan_truncated:
+        return ""
+    return (
+        f" Note: the scan stopped after {MAX_SCANNED_ENTRIES} entries, so "
+        "these results may be incomplete."
+    )
 
 
 def _format_results(
@@ -169,6 +199,7 @@ def _format_results(
     matches: list[Path],
     total: int,
     limit: int,
+    scan_truncated: bool = False,
 ) -> str:
     """Render a bounded, deterministic text result for the LLM."""
     if total == 0:
@@ -177,7 +208,7 @@ def _format_results(
             message += f" for query {query!r}"
         if extension:
             message += f" with extension {extension!r}"
-        return message + "."
+        return message + "." + _scan_note(scan_truncated)
 
     if total == 1:
         header = f"Found 1 matching file in {root!r}:"
@@ -198,6 +229,9 @@ def _format_results(
         lines.append(f"   Modified: {modified}")
         if index < len(matches):
             lines.append("")
+    note = _scan_note(scan_truncated)
+    if note:
+        lines.append(note.strip())
     return "\n".join(lines)
 
 
@@ -211,7 +245,7 @@ def _search_files(arguments: dict[str, Any]) -> str:
     if not root_path.is_dir():
         raise ToolError(f"Search root is not a directory: {root!r}.")
 
-    candidates = _collect_candidates(root_path, recursive)
+    candidates, scan_truncated = _collect_candidates(root_path, recursive)
 
     matches: list[Path] = []
     for path in candidates:
@@ -226,7 +260,13 @@ def _search_files(arguments: dict[str, Any]) -> str:
     matches.sort(key=lambda path: str(path).lower())
     total = len(matches)
     return _format_results(
-        root, query, extension, matches[:MAX_RESULTS], total, MAX_RESULTS
+        root,
+        query,
+        extension,
+        matches[:MAX_RESULTS],
+        total,
+        MAX_RESULTS,
+        scan_truncated,
     )
 
 

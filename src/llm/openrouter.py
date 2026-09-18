@@ -17,6 +17,8 @@ from openai import OpenAI
 
 from src.llm.base import (
     LLMConfigError,
+    LLMRequestError,
+    LLMToolCallError,
     BaseLLM,
     LLMResponse,
     Message,
@@ -31,12 +33,16 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 API_KEY_ENV_VAR = "OPENROUTER_API_KEY"
 MODEL_ENV_VAR = "OPENROUTER_MODEL"
 
+#: Longest provider error text kept in an LLMRequestError message; SDK errors
+#: can carry very large bodies and the console only needs the gist.
+MAX_ERROR_DETAIL = 500
+
 
 class OpenRouterConfigError(LLMConfigError):
     """Raised when required OpenRouter configuration is missing."""
 
 
-class OpenRouterToolCallError(RuntimeError):
+class OpenRouterToolCallError(LLMToolCallError):
     """Raised when a tool call in an OpenRouter response cannot be normalized."""
 
 
@@ -71,7 +77,18 @@ class OpenRouterLLM(BaseLLM):
             )
 
         self._model = resolved_model
+        # Kept only so the credential can be scrubbed out of provider error
+        # text; it is never logged, printed, or exposed.
+        self._secret = resolved_key
         self._client = OpenAI(api_key=resolved_key, base_url=OPENROUTER_BASE_URL)
+
+    def _sanitize(self, message: str) -> str:
+        """Remove the API key from provider-supplied error text."""
+        if self._secret and self._secret in message:
+            message = message.replace(self._secret, "[REDACTED]")
+        if len(message) > MAX_ERROR_DETAIL:
+            message = message[:MAX_ERROR_DETAIL] + "..."
+        return message
 
     def send_messages(
         self,
@@ -97,7 +114,15 @@ class OpenRouterLLM(BaseLLM):
         if tools:
             request_kwargs["tools"] = [self._to_openai_tool(tool) for tool in tools]
 
-        completion = self._client.chat.completions.create(**request_kwargs)
+        try:
+            completion = self._client.chat.completions.create(**request_kwargs)
+        except Exception as error:  # noqa: BLE001 - provider boundary
+            # Any SDK/transport failure becomes a provider-independent request
+            # error so the Agent can report it without provider knowledge.
+            raise LLMRequestError(
+                "OpenRouter request failed "
+                f"({type(error).__name__}): {self._sanitize(str(error))}"
+            ) from error
 
         return self._to_llm_response(completion)
 
@@ -155,7 +180,12 @@ class OpenRouterLLM(BaseLLM):
         not leak outside this adapter. The full raw completion is preserved
         on `LLMResponse.raw` for debugging or provider-specific needs.
         """
-        message = completion.choices[0].message
+        choices = getattr(completion, "choices", None) or []
+        if not choices:
+            raise LLMRequestError(
+                "OpenRouter returned a response without any choices."
+            )
+        message = choices[0].message
         content = message.content or ""
         return LLMResponse(
             content=content,

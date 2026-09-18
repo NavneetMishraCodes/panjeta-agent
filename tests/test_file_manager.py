@@ -7,6 +7,7 @@ is touched.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -198,6 +199,16 @@ class CreateFileTest(FileManagerTestCase):
             create_file_tool().function(
                 {"path": "x.txt", "content": "c", "overwrite": "yes"}
             )
+
+    def test_overwrite_flag_on_new_file_reports_created(self):
+        # overwrite=true on a path that does not exist creates the file, so the
+        # result must say so instead of claiming a replacement happened.
+        result = create_file_tool().function(
+            {"path": "fresh.txt", "content": "c", "overwrite": True}
+        )
+        self.assertIn("Created file 'fresh.txt'", result)
+        self.assertNotIn("Replaced", result)
+        self.assertEqual((self.root / "fresh.txt").read_text(), "c")
 
     def test_existing_directory_is_refused(self):
         (self.root / "dir").mkdir()
@@ -702,6 +713,376 @@ class AgentFileToolIntegrationTest(FileManagerTestCase):
         first_tool = [m for m in llm.calls[1] if m.role == "tool"][0]
         self.assertIn("confirm=true", first_tool.content)
         self.assertEqual(final, "Deleted junk.txt.")
+
+
+class StructuredResultTest(FileManagerTestCase):
+    """format='json' mode for list_directory/read_file (machine-readable)."""
+
+    def test_list_directory_json_shape(self):
+        self.write("a.txt", "x")
+        (self.root / "sub").mkdir()
+        result = list_directory_tool().function(
+            {"path": ".", "format": "json"}
+        )
+        doc = json.loads(result)
+        self.assertEqual(doc["directory"], ".")
+        self.assertFalse(doc["recursive"])
+        self.assertEqual(doc["total"], 2)
+        self.assertFalse(doc["truncated"])
+        by_name = {entry["name"]: entry for entry in doc["entries"]}
+        self.assertEqual(by_name["a.txt"]["kind"], "file")
+        self.assertEqual(by_name["sub"]["kind"], "dir")
+        self.assertIn("1 B", by_name["a.txt"]["detail"])
+        for entry in doc["entries"]:
+            self.assertEqual(
+                set(entry.keys()), {"name", "kind", "detail", "directory"}
+            )
+
+    def test_list_directory_json_recursive_bounded(self):
+        self.write("notes/a.txt", "x")
+        self.write("notes/sub/b.txt", "y")
+        doc = json.loads(
+            list_directory_tool().function(
+                {"path": ".", "format": "json", "recursive": True}
+            )
+        )
+        names = {entry["name"] for entry in doc["entries"]}
+        self.assertIn("a.txt", names)
+        self.assertIn("b.txt", names)
+        self.assertEqual(doc["total"], len(doc["entries"]))
+        self.assertFalse(doc["truncated"])
+
+    def test_list_directory_json_respects_max_depth(self):
+        self.write("notes/a.txt")
+        self.write("notes/sub/b.txt")
+        # max_depth counts directory levels walked: 1 = top directory only.
+        doc = json.loads(
+            list_directory_tool().function(
+                {"path": ".", "format": "json", "recursive": True,
+                 "max_depth": 1}
+            )
+        )
+        names = {entry["name"] for entry in doc["entries"]}
+        self.assertEqual(names, {"notes"})
+        # Depth 2 adds the immediate children of notes/ but nothing deeper.
+        doc = json.loads(
+            list_directory_tool().function(
+                {"path": ".", "format": "json", "recursive": True,
+                 "max_depth": 2}
+            )
+        )
+        names = {entry["name"] for entry in doc["entries"]}
+        self.assertEqual(names, {"notes", "a.txt", "sub"})
+
+    def test_list_directory_json_entry_bound(self):
+        (self.root / "big").mkdir()
+        for i in range(MAX_LIST_ENTRIES + 7):
+            (self.root / "big" / f"f{i:03d}.txt").write_text("x")
+        doc = json.loads(
+            list_directory_tool().function(
+                {"path": "big", "format": "json", "recursive": True}
+            )
+        )
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(len(doc["entries"]), MAX_LIST_ENTRIES)
+        self.assertEqual(doc["total"], MAX_LIST_ENTRIES)
+
+    def test_read_file_json_shape(self):
+        self.write("f.txt", "héllo")
+        doc = json.loads(
+            read_file_tool().function({"path": "f.txt", "format": "json"})
+        )
+        self.assertEqual(doc["path"], "f.txt")
+        self.assertEqual(doc["content"], "héllo")
+        self.assertFalse(doc["truncated"])
+        self.assertEqual(doc["bytes"], len("héllo".encode("utf-8")))
+
+    def test_read_file_json_truncation_bounded(self):
+        self.write("big.txt", "y" * (MAX_READ_BYTES + 10))
+        doc = json.loads(
+            read_file_tool().function({"path": "big.txt", "format": "json"})
+        )
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(len(doc["content"]), MAX_READ_BYTES)
+        self.assertEqual(doc["bytes"], MAX_READ_BYTES + 10)
+
+    def test_invalid_format_is_a_clean_tool_error(self):
+        with self.assertRaises(ToolError) as ctx:
+            list_directory_tool().function({"path": ".", "format": "yaml"})
+        self.assertIn("must be one of", str(ctx.exception))
+        with self.assertRaises(ToolError):
+            read_file_tool().function({"path": "x.txt", "format": 1})
+
+
+class SandboxEscapeRegressionTest(unittest.TestCase):
+    """Tool-level regression for the Phase 9 sandbox-boundary bug.
+
+    The file root sits two levels below a temporary directory, so the root's
+    real parent and grandparent exist and are writable: exactly the targets the
+    old ``_is_within(root, probe) or _is_within(probe, root)`` check wrongly
+    accepted. Every tool must reject them, a decoy file living outside the root
+    must stay unreadable and untouched, and legitimate work inside the root
+    must keep working.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.grandparent = Path(os.path.realpath(tmp.name))
+        self.parent = self.grandparent / "mid"
+        self.parent.mkdir()
+        self.root = self.parent / "sandbox"
+        self.root.mkdir()
+        env = mock.patch.dict(
+            os.environ, {FILE_ROOT_ENV_VAR: str(self.root)}
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        # A decoy outside the sandbox: the escape tests must never read,
+        # delete, or overwrite it.
+        (self.grandparent / "secret.txt").write_text(
+            "outside-secret", encoding="utf-8"
+        )
+        (self.root / "notes").mkdir()
+        (self.root / "notes" / "a.txt").write_text("inside", encoding="utf-8")
+
+    def outside_snapshot(self) -> dict[str, tuple[str, bytes | None]]:
+        """Everything outside the sandbox: path -> (kind, content)."""
+        snapshot: dict[str, tuple[str, bytes | None]] = {}
+        for path in self.grandparent.rglob("*"):
+            if path == self.root or self.root in path.parents:
+                continue
+            if path.is_dir():
+                snapshot[str(path)] = ("dir", None)
+            else:
+                snapshot[str(path)] = ("file", path.read_bytes())
+        return snapshot
+
+    def assert_rejected(self, call, arguments: dict) -> str:
+        """Run one tool call; require a boundary refusal, return the text."""
+        with self.assertRaises(ToolError) as ctx:
+            call(arguments)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "outside the Panjeta file root" in message
+            or "not allowed inside the Panjeta file root" in message,
+            f"unexpected rejection message: {message}",
+        )
+        return message
+
+    # -- writes above the sandbox ------------------------------------------
+
+    def test_create_file_in_parent_is_refused(self):
+        before = self.outside_snapshot()
+        target = str(self.parent / "evil.txt")
+        self.assert_rejected(
+            create_file_tool().function,
+            {"path": target, "content": "pwned"},
+        )
+        self.assertFalse((self.parent / "evil.txt").exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_create_file_in_grandparent_is_refused(self):
+        before = self.outside_snapshot()
+        target = str(self.grandparent / "evil.txt")
+        self.assert_rejected(
+            create_file_tool().function,
+            {"path": target, "content": "pwned"},
+        )
+        self.assertFalse((self.grandparent / "evil.txt").exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_create_file_in_not_yet_existing_chain_above_root_refused(self):
+        before = self.outside_snapshot()
+        target = str(self.grandparent / "new" / "deep" / "evil.txt")
+        self.assert_rejected(
+            create_file_tool().function,
+            {"path": target, "content": "pwned"},
+        )
+        self.assertFalse((self.grandparent / "new").exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_create_directory_above_root_is_refused(self):
+        before = self.outside_snapshot()
+        for target in (
+            str(self.parent / "newdir"),
+            str(self.grandparent / "newdir"),
+        ):
+            with self.subTest(target=target):
+                self.assert_rejected(
+                    create_directory_tool().function, {"path": target}
+                )
+                self.assertFalse(Path(target).exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_overwrite_of_outside_file_is_refused(self):
+        before = self.outside_snapshot()
+        self.assert_rejected(
+            create_file_tool().function,
+            {
+                "path": str(self.grandparent / "secret.txt"),
+                "content": "clobbered",
+                "overwrite": True,
+            },
+        )
+        self.assertEqual(
+            (self.grandparent / "secret.txt").read_text(encoding="utf-8"),
+            "outside-secret",
+        )
+        self.assertEqual(self.outside_snapshot(), before)
+    # -- reads and listings above the sandbox -------------------------------
+
+    def test_list_directory_of_ancestors_is_refused(self):
+        before = self.outside_snapshot()
+        for target in (str(self.parent), str(self.grandparent)):
+            with self.subTest(target=target):
+                self.assert_rejected(
+                    list_directory_tool().function, {"path": target}
+                )
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_read_file_outside_root_is_refused(self):
+        before = self.outside_snapshot()
+        message = self.assert_rejected(
+            read_file_tool().function,
+            {"path": str(self.grandparent / "secret.txt")},
+        )
+        self.assertNotIn("outside-secret", message)
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_traversal_equivalents_are_refused(self):
+        before = self.outside_snapshot()
+        for evil in (
+            "../evil.txt",
+            "notes/../../evil.txt",
+            str(self.root / ".." / "evil.txt"),
+            str(self.root / ".." / ".." / "evil.txt"),
+        ):
+            with self.subTest(path=evil):
+                with self.assertRaises(ToolError) as ctx:
+                    create_file_tool().function(
+                        {"path": evil, "content": "pwned"}
+                    )
+                self.assertIn("..", str(ctx.exception))
+        self.assertFalse((self.parent / "evil.txt").exists())
+        self.assertFalse((self.grandparent / "evil.txt").exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+
+    # -- copy / move / rename destinations above the sandbox ----------------
+
+    def test_copy_file_to_outside_destination_is_refused(self):
+        before = self.outside_snapshot()
+        self.assert_rejected(
+            copy_file_tool().function,
+            {
+                "source": "notes/a.txt",
+                "destination": str(self.parent / "copy.txt"),
+            },
+        )
+        self.assertFalse((self.parent / "copy.txt").exists())
+        self.assertEqual(
+            (self.root / "notes" / "a.txt").read_text(encoding="utf-8"),
+            "inside",
+        )
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_move_file_to_outside_destination_is_refused(self):
+        before = self.outside_snapshot()
+        self.assert_rejected(
+            move_file_tool().function,
+            {
+                "source": "notes/a.txt",
+                "destination": str(self.grandparent / "moved.txt"),
+            },
+        )
+        self.assertFalse((self.grandparent / "moved.txt").exists())
+        # The source is still exactly where it was.
+        self.assertEqual(
+            (self.root / "notes" / "a.txt").read_text(encoding="utf-8"),
+            "inside",
+        )
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_move_directory_to_outside_destination_is_refused(self):
+        before = self.outside_snapshot()
+        self.assert_rejected(
+            move_directory_tool().function,
+            {
+                "source": "notes",
+                "destination": str(self.parent / "notes"),
+            },
+        )
+        self.assertTrue((self.root / "notes" / "a.txt").is_file())
+        self.assertFalse((self.parent / "notes").exists())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_rename_to_a_path_outside_root_is_refused(self):
+        before = self.outside_snapshot()
+        for new_name in (
+            "..\\moved.txt",
+            "../moved.txt",
+            str(self.parent / "moved.txt"),
+        ):
+            with self.subTest(new_name=new_name):
+                with self.assertRaises(ToolError):
+                    rename_file_tool().function(
+                        {"source": "notes/a.txt", "new_name": new_name}
+                    )
+        self.assertTrue((self.root / "notes" / "a.txt").is_file())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    # -- deletions above the sandbox ---------------------------------------
+
+    def test_delete_file_outside_root_is_refused(self):
+        before = self.outside_snapshot()
+        self.assert_rejected(
+            delete_file_tool().function,
+            {"path": str(self.grandparent / "secret.txt"), "confirm": True},
+        )
+        self.assertEqual(
+            (self.grandparent / "secret.txt").read_text(encoding="utf-8"),
+            "outside-secret",
+        )
+        self.assertEqual(self.outside_snapshot(), before)
+
+    def test_delete_directory_ancestor_is_refused(self):
+        before = self.outside_snapshot()
+        for target in (str(self.parent), str(self.grandparent)):
+            with self.subTest(target=target):
+                self.assert_rejected(
+                    delete_directory_tool().function,
+                    {"path": target, "confirm": True},
+                )
+                self.assertTrue(Path(target).is_dir())
+        self.assertEqual(self.outside_snapshot(), before)
+
+    # -- the sandbox still works -------------------------------------------
+
+    def test_legitimate_operations_inside_root_still_succeed(self):
+        create_directory_tool().function({"path": "work"})
+        create_file_tool().function({"path": "work/a.txt", "content": "one"})
+        copy_file_tool().function(
+            {"source": "work/a.txt", "destination": "work/b.txt"}
+        )
+        move_file_tool().function(
+            {"source": "work/b.txt", "destination": "work/c.txt"}
+        )
+        rename_file_tool().function(
+            {"source": "work/c.txt", "new_name": "d.txt"}
+        )
+        read_file_tool().function({"path": "work/d.txt"})
+        listing = list_directory_tool().function({"path": "work"})
+        self.assertIn("a.txt", listing)
+        self.assertIn("d.txt", listing)
+        self.assertEqual(
+            (self.root / "work" / "a.txt").read_text(encoding="utf-8"), "one"
+        )
+        # Nothing escaped: the decoy outside the root is still untouched.
+        self.assertEqual(
+            (self.grandparent / "secret.txt").read_text(encoding="utf-8"),
+            "outside-secret",
+        )
 
 
 if __name__ == "__main__":

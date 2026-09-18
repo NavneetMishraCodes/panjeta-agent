@@ -203,3 +203,36 @@ class SessionStore:
                 "Could not remove session file (%s).",
                 type(error).__name__,
             )
+
+    def status(self) -> dict[str, Any]:
+        """Describe the current session without exposing message contents.
+
+        Returns keys: ``path``, ``exists``, ``version``, ``message_count``.
+        ``version``/``message_count`` are ``None`` when no file exists or
+        the stored document cannot be interpreted. Never includes message
+        text, so no conversation content (and no secret) can leak through
+        status output.
+        """
+        info: dict[str, Any] = {
+            "path": str(self.path),
+            "exists": self.path.is_file(),
+            "version": None,
+            "message_count": None,
+        }
+        if not info["exists"]:
+            return info
+        try:
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            logger.warning(
+                "Session file cannot be read (%s).", type(error).__name__
+            )
+            return info
+        if isinstance(document, dict):
+            version = document.get("version")
+            messages = document.get("messages")
+            if isinstance(version, int):
+                info["version"] = version
+            if isinstance(messages, list):
+                info["message_count"] = len(messages)
+        return info

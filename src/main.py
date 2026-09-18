@@ -24,10 +24,14 @@ import sys
 
 from dotenv import load_dotenv
 
-from src.agent import Agent, AgentMaximumIterationsError
+from src.agent import Agent, AgentError
 from src.approval import ConsoleApprover
 from src.llm import LLMConfigError, create_llm
-from src.session import SessionStore, resolve_session_file
+from src.session import (
+    SESSION_VERSION,
+    SessionStore,
+    resolve_session_file,
+)
 from src.tools import ToolRegistry, calculator_tool, search_files_tool
 from src.tools.file_manager import (
     copy_file_tool,
@@ -83,10 +87,24 @@ def _parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fresh",
         "--fresh-session",
+        dest="fresh_session",
         action="store_true",
         help="Start with a clean conversation instead of restoring the "
         "previous session (the old session file is replaced on save).",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    session_parser = subparsers.add_parser(
+        "session", help="Inspect or reset the persistent session."
+    )
+    session_parser.add_argument(
+        "session_action",
+        choices=("status", "reset"),
+        help=(
+            "status: show whether a session exists, its configured path, "
+            "and its message count. reset: clear the configured session."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -162,11 +180,51 @@ def run_interactive(agent: Agent) -> int:
 
         try:
             answer = agent.run(instruction)
-        except AgentMaximumIterationsError as error:
+        except AgentError as error:
+            # Provider failures and over-long tool loops are reported locally
+            # and the session stays alive: a failed turn persists nothing.
             print(f"\nPanjeta: {error}")
             continue
         print_agent_output(answer)
 
+    return 0
+
+
+def _print_session_status(store: SessionStore) -> int:
+    """Print non-sensitive facts about the configured session."""
+    info = store.status()
+    print(f"Session file: {info['path']}")
+    if not info["exists"]:
+        print("Status: no session yet (a new one starts on next run).")
+        return 0
+    version = info["version"]
+    count = info["message_count"]
+    if version is None or count is None:
+        print("Status: present, but unreadable/corrupt (a fresh session "
+              "will be started on next run).")
+        return 0
+    if version != SESSION_VERSION:
+        print(f"Status: present, but version {version} is incompatible "
+              f"with version {SESSION_VERSION} (a fresh session will be "
+              "started on next run).")
+        return 0
+    print(f"Status: present (format version {version}).")
+    print(f"Messages stored: {count} (bounded to {store.max_messages}).")
+    return 0
+
+
+def _run_session_command(action: str) -> int:
+    """Handle ``panjeta session status|reset`` (no provider/API key needed)."""
+    store = SessionStore()
+    if action == "status":
+        return _print_session_status(store)
+    # action == "reset": invoking the command IS the explicit user action.
+    existed = store.status()["exists"]
+    store.clear()
+    if existed:
+        print(f"Session cleared: {store.path}")
+    else:
+        print(f"No session to clear ({store.path}).")
     return 0
 
 
@@ -187,6 +245,11 @@ def main(argv=None) -> int:
     )
 
     args = _parse_args(argv)
+
+    if getattr(args, "command", None) == "session":
+        # Session controls are purely local: no provider, no API key.
+        return _run_session_command(args.session_action)
+
     provider = _resolve_provider(args.provider)
     session_file = resolve_session_file()
     store = SessionStore(session_file)

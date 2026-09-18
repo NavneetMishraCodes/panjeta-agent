@@ -42,6 +42,7 @@ from src.tools.file_manager import (
 )
 from src.tools.files import (
     MAX_RESULTS as SEARCH_FILES_MAX_RESULTS,
+    MAX_SCANNED_ENTRIES as SEARCH_FILES_MAX_SCANNED_ENTRIES,
     SEARCH_FILES_DEFINITION,
     SEARCH_FILES_NAME,
     search_files_tool,
@@ -68,6 +69,7 @@ __all__ = [
     "SEARCH_FILES_NAME",
     "SEARCH_FILES_DEFINITION",
     "SEARCH_FILES_MAX_RESULTS",
+    "SEARCH_FILES_MAX_SCANNED_ENTRIES",
     "search_files_tool",
     "LIST_DIRECTORY_NAME",
     "LIST_DIRECTORY_DEFINITION",

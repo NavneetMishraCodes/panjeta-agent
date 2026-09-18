@@ -35,6 +35,17 @@ class AgentMaximumIterationsError(AgentError):
     """Raised when the agent exceeds the allowed tool-calling iterations."""
 
 
+class AgentLLMError(AgentError):
+    """Raised when the LLM provider cannot produce a usable response.
+
+    Provider/SDK/transport failures, malformed provider payloads, unusable
+    tool calls, and empty responses all surface as this single agent-level
+    error, so callers can tell the user what went wrong and keep running
+    without the core agent knowing which provider is configured. Provider
+    error text has already been scrubbed of credentials by the provider.
+    """
+
+
 # Tool/registry errors we convert into LLM-visible tool-result messages.
 # Anything else is treated as a genuine bug and is not swallowed.
 _TOOL_ERRORS = (
@@ -45,6 +56,17 @@ _TOOL_ERRORS = (
 )
 
 DEFAULT_MAX_ITERATIONS = 8
+
+#: Longest provider failure text carried into an AgentLLMError message.
+MAX_ERROR_DETAIL = 500
+
+
+def _short_error_text(error: BaseException) -> str:
+    """Return a bounded, readable description of a provider failure."""
+    text = str(error).strip() or error.__class__.__name__
+    if len(text) > MAX_ERROR_DETAIL:
+        text = text[:MAX_ERROR_DETAIL] + "..."
+    return text
 
 
 def _as_documents(messages: list[Message]) -> list[dict[str, Any]]:
@@ -108,19 +130,25 @@ class Agent:
         """Run one conversation turn: return the final assistant text.
 
         Raises:
+            AgentLLMError: If the provider cannot produce a usable response.
+                Nothing is persisted for that turn, so the session survives.
             AgentMaximumIterationsError: If the model keeps requesting
                 tools until the iteration limit is reached.
         """
         history = self._new_history(user_message)
 
         for _ in range(self.max_iterations):
-            response = self._llm.send_messages(
-                messages=history,
-                tools=self._registry.list_definitions() or None,
-            )
+            response = self._request_llm(history)
             history.append(self._assistant_message(response))
 
             if not response.tool_calls:
+                if not response.content.strip():
+                    # No text and no tool calls: never report this as a
+                    # successful (empty) answer.
+                    raise AgentLLMError(
+                        "The model returned no usable content (no text and "
+                        "no tool calls). Nothing was executed."
+                    )
                 self._persist(history)
                 return response.content
 
@@ -193,6 +221,28 @@ class Agent:
             content=response.content,
             tool_calls=response.tool_calls or None,
         )
+
+    def _request_llm(self, history: list[Message]) -> LLMResponse:
+        """Ask the provider for the next step, converting failures clearly.
+
+        The provider boundary is ``BaseLLM.send_messages``, so anything raised
+        there (an SDK/transport error, a malformed provider response, an
+        unusable tool call) is reported as one provider-independent
+        ``AgentLLMError`` instead of escaping as a raw traceback. Genuine
+        Agent errors are passed through untouched.
+        """
+        try:
+            return self._llm.send_messages(
+                messages=history,
+                tools=self._registry.list_definitions() or None,
+            )
+        except AgentError:
+            raise
+        except Exception as error:  # noqa: BLE001 - provider boundary
+            raise AgentLLMError(
+                "The LLM provider failed "
+                f"({type(error).__name__}): {_short_error_text(error)}"
+            ) from error
 
     def _execute_tool(self, call: ToolCall) -> str:
         """Execute one tool call, returning its result or a readable error.

@@ -8,6 +8,8 @@ into deep modules. The Agent depends only on the generic types from
 
 from src.llm.base import (
     LLMConfigError,
+    LLMRequestError,
+    LLMToolCallError,
     BaseLLM,
     LLMResponse,
     Message,
@@ -32,6 +34,8 @@ from src.llm.openrouter import (
 __all__ = [
     # provider-independent types and interface
     "LLMConfigError",
+    "LLMRequestError",
+    "LLMToolCallError",
     "BaseLLM",
     "LLMResponse",
     "Message",

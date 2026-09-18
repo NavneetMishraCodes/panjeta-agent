@@ -13,12 +13,17 @@ Policy:
       directory inside the project itself. No unrestricted access is ever
       granted.
     * Relative paths are interpreted against the root.
-    * Absolute paths are allowed only when they resolve inside the root.
+    * Absolute paths are allowed only when they resolve inside the root. The
+      root's own parents (and grandparents) are never valid targets, so no
+      tool can read, list, create, or overwrite anything above the root.
     * ``..`` components are rejected outright (no silent normalization).
-    * Symlink containment is enforced by canonicalising the deepest
-      existing ancestor of the requested path; non-existing trailing
+    * Symlink/junction containment is enforced by canonicalising the deepest
+      existing ancestor of the requested path and then requiring the *final*
+      resolved path to live inside the canonical root; non-existing trailing
       components (destinations of create/copy/move) are validated through
       their existing canonical parent.
+    * Directory walks ask :func:`is_link_like` before descending, so links are
+      never followed out of the requested tree.
 """
 
 from __future__ import annotations
@@ -72,6 +77,21 @@ def _is_within(root: Path, target: Path) -> bool:
         return False
 
 
+def is_link_like(path: str | Path) -> bool:
+    """Whether ``path`` is a link that redirects to another location.
+
+    Covers symlinks everywhere and Windows directory junctions, which
+    ``os.path.islink`` reports as ``False`` even though they redirect exactly
+    like a symlink. Traversal code uses this so directory walks never follow a
+    link out of the requested tree (or around a cycle).
+    """
+    if os.path.islink(str(path)):
+        return True
+    # Path.is_junction() exists on Python 3.12+ and is False off Windows.
+    is_junction = getattr(Path(path), "is_junction", None)
+    return bool(is_junction()) if callable(is_junction) else False
+
+
 def resolve_allowed_path(path: str, *, must_exist: bool = False) -> Path:
     """Validate ``path`` against the configured root and return its location.
 
@@ -114,11 +134,10 @@ def resolve_within_root(
     candidate = raw_path if raw_path.is_absolute() else root / raw_path
     candidate = Path(os.path.abspath(str(candidate)))
 
-    # Ascend to the deepest existing ancestor, canonicalise it (following
-    # symlinks) and verify it is inside the root. Non-existing trailing
-    # components (write destinations) are rebuilt onto that canonical
-    # ancestor afterwards, which keeps symlinked prefixes safe without
-    # rejecting valid not-yet-created paths.
+    # Ascend to the deepest existing ancestor and canonicalise it (following
+    # symlinks/junctions); non-existing trailing components (destinations of
+    # create/copy/move/rename) are rebuilt onto that canonical ancestor
+    # afterwards.
     probe = candidate
     suffix: list[str] = []
     while not os.path.lexists(str(probe)):
@@ -128,12 +147,24 @@ def resolve_within_root(
             break
         probe = parent
 
-    if not (_is_within(root, probe) or _is_within(probe, root)):
-        raise ToolError(f"Path {path!r} is outside the Panjeta file root ({root}).")
-
     resolved = Path(os.path.realpath(str(probe)))
     for part in reversed(suffix):
         resolved = resolved / part
+
+    # Containment is decided on the final resolved path and never the other
+    # way round: the target must live *inside* the root. Checking whether the
+    # root lives inside the probe instead would also accept the root's own
+    # ancestors (parent, grandparent, ...) and let writes and listings escape
+    # the sandbox. `realpath` canonicalises the existing prefix, so a
+    # symlinked or junctioned parent that resolves outside the root is
+    # rejected even when the destination does not exist yet, while a root that
+    # has not been created yet still validates its own subtree.
+    canonical_root = Path(os.path.realpath(str(root)))
+    if not _is_within(canonical_root, resolved):
+        raise ToolError(
+            f"Path {path!r} is outside the Panjeta file root "
+            f"({canonical_root})."
+        )
 
     if must_exist and not os.path.lexists(str(resolved)):
         raise ToolError(f"Path does not exist: {path!r}.")
