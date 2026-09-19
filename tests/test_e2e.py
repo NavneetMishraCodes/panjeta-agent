@@ -9,6 +9,7 @@ denier) instead of interactive prompts. No network, no API keys.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ from src.tools import (
     read_file_tool,
     rename_file_tool,
     search_files_tool,
+    delete_files_tool,
 )
 from src.tools.paths import FILE_ROOT_ENV_VAR
 
@@ -489,7 +491,11 @@ class SandboxBoundaryFlowTest(unittest.TestCase):
         )
         # The attempt reached the model as a real tool failure...
         refusal = self._tool_results(llm, 1)[-1]
-        self.assertIn("outside the Panjeta file root", refusal)
+        self.assertTrue(
+            "outside the Panjeta file root" in refusal
+            or "protected system location" in refusal,
+            f"unexpected refusal: {refusal}",
+        )
         # ...and nothing outside the sandbox was created or changed.
         self.assertFalse((self.parent / "escaped.txt").exists())
         self.assertEqual(self._outside_state(), before)
@@ -518,7 +524,11 @@ class SandboxBoundaryFlowTest(unittest.TestCase):
         for result in results:
             self.assertIn("failed", result)
         self.assertTrue(
-            any("outside the Panjeta file root" in r for r in results)
+            any(
+                "outside the Panjeta file root" in r
+                or "protected system location" in r
+                for r in results
+            )
         )
         self.assertTrue(any("'..'" in r for r in results))
         self.assertEqual(self._outside_state(), before)
@@ -545,5 +555,181 @@ class SandboxBoundaryFlowTest(unittest.TestCase):
         self.assertIn("Created file 'notes/ok.txt'", created)
 
 
+
+class ComputerWidePermissionsE2E(unittest.TestCase):
+    """The target workflow: 'Delete all the MP4 files in my Downloads.'
+
+    Builds a fake computer (Downloads / Documents / protected) in a
+    repo-local directory -- NOT under %LOCALAPPDATA%, because that is a
+    protected system location and the permission layer would rightly
+    refuse to authorize it. Drives the real Agent -> Registry ->
+    permissions -> Approval -> filesystem pipeline with a scripted LLM.
+    """
+
+    ALLOWED_ENV = "PANJETA_ALLOWED_ROOTS"
+    LEVELS_ENV = "PANJETA_ALLOWED_ROOTS_LEVELS"
+
+    def setUp(self) -> None:
+        base = Path(__file__).resolve().parent.parent / "_e2e_computer"
+        if base.exists():
+            shutil.rmtree(base)
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+
+        self.workspace = base / "workspace"
+        self.downloads = base / "Downloads"
+        self.documents = base / "Documents"
+        self.protected_dir = base / "protected"
+        for directory in (
+            self.workspace,
+            self.downloads,
+            self.documents,
+            self.protected_dir,
+        ):
+            directory.mkdir(parents=True)
+
+        (self.downloads / "video1.mp4").write_text("v1", encoding="utf-8")
+        (self.downloads / "video2.mp4").write_text("v2", encoding="utf-8")
+        (self.downloads / "document.pdf").write_text("pdf", encoding="utf-8")
+        (self.downloads / "image.png").write_text("img", encoding="utf-8")
+        (self.documents / "important.txt").write_text(
+            "doc", encoding="utf-8"
+        )
+        (self.protected_dir / "system.txt").write_text(
+            "sys", encoding="utf-8"
+        )
+
+        env = mock.patch.dict(
+            os.environ,
+            {
+                FILE_ROOT_ENV_VAR: str(self.workspace),
+                self.ALLOWED_ENV: (
+                    f"Downloads={self.downloads}"
+                    f";Documents={self.documents}"
+                ),
+                self.LEVELS_ENV: "READ,WRITE,DELETE",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _run(self, responses, approver):
+        agent, llm = make_agent(responses, approver=approver)
+        result = agent.run("Delete all the MP4 files in my Downloads folder.")
+        return result, llm
+
+
 if __name__ == "__main__":
     unittest.main()
+
+    def test_search_then_approved_bulk_delete_deletes_only_matches(self):
+        approver = AutoApprover()
+        result, llm = self._run(
+            [
+                response_call(
+                    "s1",
+                    "search_files",
+                    root=str(self.downloads),
+                    pattern="*.mp4",
+                ),
+                response_call(
+                    "s2",
+                    "delete_files",
+                    directory="Downloads",
+                    pattern="*.mp4",
+                    confirm=True,
+                ),
+                response_text("Deleted the two MP4 videos from Downloads."),
+            ],
+            approver,
+        )
+
+        self.assertIn("MP4", result)
+        # Only the matched files are gone.
+        self.assertFalse((self.downloads / "video1.mp4").exists())
+        self.assertFalse((self.downloads / "video2.mp4").exists())
+        # Everything else is preserved.
+        self.assertTrue((self.downloads / "document.pdf").exists())
+        self.assertTrue((self.downloads / "image.png").exists())
+        self.assertTrue((self.documents / "important.txt").exists())
+        self.assertTrue((self.protected_dir / "system.txt").exists())
+        # The human was asked with a full preview of the deletion set.
+        self.assertEqual(len(approver.asked), 1)
+        question = approver.asked[0]
+        self.assertIn("video1.mp4", question)
+        self.assertIn("video2.mp4", question)
+        self.assertIn("cannot be undone", question)
+        # The agent actually observed the search results before deleting.
+        tool_result = llm.calls[1][-1]["content"]
+        self.assertIn("video1.mp4", tool_result)
+
+
+
+    def test_denied_bulk_delete_preserves_everything(self):
+        denier = DenyApprover()
+        result, _ = self._run(
+            [
+                response_call(
+                    "s2",
+                    "delete_files",
+                    directory="Downloads",
+                    pattern="*.mp4",
+                    confirm=True,
+                ),
+                response_text("Understood, nothing was deleted."),
+            ],
+            denier,
+        )
+
+        self.assertIn("did not approve", result)
+        for name in (
+            "video1.mp4",
+            "video2.mp4",
+            "document.pdf",
+            "image.png",
+        ):
+            self.assertTrue((self.downloads / name).exists(), name)
+        self.assertTrue((self.documents / "important.txt").exists())
+        self.assertTrue((self.protected_dir / "system.txt").exists())
+
+    def test_llm_cannot_reach_unauthorized_locations(self):
+        approver = AutoApprover()
+        result, llm = self._run(
+            [
+                # Attempt 1: an unregistered "self-grant" tool.
+                response_call(
+                    "g1",
+                    "grant_permission",
+                    name="C:\\Windows",
+                ),
+                # Attempt 2: bulk delete in a location that is neither
+                # the sandbox nor an allowed root (sibling "protected").
+                response_call(
+                    "g2",
+                    "delete_files",
+                    directory=str(self.protected_dir),
+                    pattern="*.txt",
+                    confirm=True,
+                ),
+                # Attempt 3: traversal from the sandbox onto an
+                # unauthorized sibling.
+                response_call(
+                    "g3",
+                    "delete_file",
+                    path="../Documents/important.txt",
+                    confirm=True,
+                ),
+                response_text("I could not do those things."),
+            ],
+            approver,
+        )
+
+        self.assertIn("could not do those", result)
+        # Nothing was deleted anywhere.
+        self.assertTrue((self.downloads / "video1.mp4").exists())
+        self.assertTrue((self.documents / "important.txt").exists())
+        self.assertTrue((self.protected_dir / "system.txt").exists())
+        # The human was NEVER asked: permission failures happen before
+        # the approval gate, and the LLM cannot grant itself access.
+        self.assertEqual(approver.asked, [])
+        # All three attempts came back as tool failures for the model.
+        self.assertEqual(len(llm.calls), 4)

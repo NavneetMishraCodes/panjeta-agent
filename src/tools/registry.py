@@ -16,9 +16,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.approval import ApprovalDeniedError
 from src.llm.base import ToolDefinition
 from src.tools.base import Tool, ToolError
+
+# NOTE: ApprovalDeniedError is imported lazily inside the methods below.
+# A module-level import creates a cycle: `import src.approval` executes
+# src/tools/__init__.py (via src.tools.base), which imports this module,
+# which would re-enter the still-initializing src.approval.
 
 
 class ToolRegistrationError(RuntimeError):
@@ -146,6 +150,8 @@ class ToolRegistry:
         """
         if not self._needs_approval(tool, arguments):
             return
+        from src.approval import ApprovalDeniedError
+
         if self._approver is None:
             raise ApprovalDeniedError(
                 f"Tool {tool.name!r} requires human approval, but no "

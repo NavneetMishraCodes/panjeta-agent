@@ -28,6 +28,7 @@ input, and are provider-independent):
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
@@ -36,7 +37,12 @@ from typing import Any
 
 from src.llm.base import ToolDefinition
 from src.tools.base import Tool, ToolError
-from src.tools.paths import ensure_file_root, is_link_like, resolve_within_root
+from src.tools.paths import (
+    ensure_file_root,
+    is_link_like,
+    resolve_allowed_path,
+)
+from src.tools.permissions import DELETE, READ, WRITE
 
 LIST_DIRECTORY_NAME = "list_directory"
 READ_FILE_NAME = "read_file"
@@ -304,7 +310,7 @@ def _format_listing(
 def _list_directory(arguments: dict[str, Any]) -> str:
     root = ensure_file_root()
     display = _require_text(arguments, "path")
-    resolved = resolve_within_root(root, display, must_exist=True)
+    resolved = resolve_allowed_path(display, must_exist=True, level=READ)
 
     if not resolved.is_dir():
         raise ToolError(f"'{display}' is not a directory (it is a file).")
@@ -413,7 +419,7 @@ def _read_file(arguments: dict[str, Any]) -> str:
     root = ensure_file_root()
     display = _require_text(arguments, "path")
     output_format = _optional_result_format(arguments)
-    resolved = resolve_within_root(root, display, must_exist=True)
+    resolved = resolve_allowed_path(display, must_exist=True, level=READ)
     _require_existing_file(resolved, display)
 
     try:
@@ -497,7 +503,7 @@ def _create_file(arguments: dict[str, Any]) -> str:
     content = _require_string(arguments, "content")
     overwrite = _optional_flag(arguments, "overwrite")
 
-    resolved = resolve_within_root(root, display)
+    resolved = resolve_allowed_path(display, level=WRITE)
 
     existed = os.path.lexists(str(resolved))
     if existed:
@@ -609,10 +615,10 @@ def _copy_or_move(
     source_display = _require_text(arguments, "source")
     destination_display = _require_text(arguments, "destination")
 
-    source = resolve_within_root(root, source_display, must_exist=True)
+    source = resolve_allowed_path(source_display, must_exist=True, level=READ)
     _require_existing_file(source, source_display)
 
-    destination = resolve_within_root(root, destination_display)
+    destination = resolve_allowed_path(destination_display, level=WRITE)
     if os.path.lexists(str(destination)):
         raise ToolError(
             f"Destination already exists: '{destination_display}'. "
@@ -752,14 +758,16 @@ def _rename_file(arguments: dict[str, Any]) -> str:
     source_display = _require_text(arguments, "source")
     new_name = _validate_new_name(_require_text(arguments, "new_name"))
 
-    source = resolve_within_root(root, source_display, must_exist=True)
+    source = resolve_allowed_path(source_display, must_exist=True, level=WRITE)
     _require_existing_file(source, source_display)
 
     # The parent is already canonical and inside the root, and new_name
     # contains no separators, so the destination is inside the root by
     # construction. Re-validating through the shared helper keeps a single
     # containment authority for every path the tools touch.
-    destination = resolve_within_root(root, str(source.parent / new_name))
+    destination = resolve_allowed_path(
+        str(source.parent / new_name), level=WRITE
+    )
     if os.path.lexists(str(destination)):
         raise ToolError(
             f"Cannot rename: '{new_name}' already exists in that folder. "
@@ -827,7 +835,7 @@ def _delete_file(arguments: dict[str, Any]) -> str:
             "Nothing was deleted."
         )
 
-    resolved = resolve_within_root(root, display, must_exist=True)
+    resolved = resolve_allowed_path(display, must_exist=True, level=DELETE)
     if resolved.is_dir():
         raise ToolError(
             f"Refusing to delete '{display}': it is a directory. "
@@ -897,7 +905,7 @@ CREATE_DIRECTORY_DEFINITION = ToolDefinition(
 def _create_directory(arguments: dict[str, Any]) -> str:
     root = ensure_file_root()
     display = _require_text(arguments, "path")
-    resolved = resolve_within_root(root, display)
+    resolved = resolve_allowed_path(display, level=WRITE)
 
     if os.path.lexists(str(resolved)):
         kind = "directory" if resolved.is_dir() else "file"
@@ -965,7 +973,7 @@ def _delete_directory(arguments: dict[str, Any]) -> str:
             "Nothing was deleted."
         )
 
-    resolved = resolve_within_root(root, display, must_exist=True)
+    resolved = resolve_allowed_path(display, must_exist=True, level=DELETE)
     if not resolved.is_dir():
         raise ToolError(
             f"Refusing to delete '{display}': it is not a directory."
@@ -1052,14 +1060,14 @@ def _move_directory(arguments: dict[str, Any]) -> str:
     source_display = _require_text(arguments, "source")
     destination_display = _require_text(arguments, "destination")
 
-    source = resolve_within_root(root, source_display, must_exist=True)
+    source = resolve_allowed_path(source_display, must_exist=True, level=WRITE)
     if not source.is_dir():
         raise ToolError(
             f"'{source_display}' is not a directory; use move_file for "
             "files."
         )
 
-    destination = resolve_within_root(root, destination_display)
+    destination = resolve_allowed_path(destination_display, level=WRITE)
     if os.path.lexists(str(destination)):
         raise ToolError(
             f"Destination already exists: '{destination_display}'. "
@@ -1094,4 +1102,211 @@ def move_directory_tool() -> Tool:
     return Tool(
         definition=MOVE_DIRECTORY_DEFINITION,
         function=_move_directory,
+    )
+
+# ---------------------------------------------------------------------------
+# delete_files (bulk, scoped, approval-gated)
+# ---------------------------------------------------------------------------
+
+DELETE_FILES_NAME = "delete_files"
+
+#: Upper bound on files one bulk deletion may touch. A larger match
+#: list is refused so the model must narrow the pattern -- the human
+#: should never be asked to approve an unbounded deletion.
+MAX_BULK_DELETE_FILES = 100
+
+#: How many target names the approval question lists in full before
+#: summarising the rest.
+BULK_DELETE_LIST_LIMIT = 20
+
+DELETE_FILES_DEFINITION = ToolDefinition(
+    name=DELETE_FILES_NAME,
+    description=(
+        "Delete all files directly inside one directory whose names "
+        "match a glob pattern (for example pattern '*.mp4'). The scope "
+        "is exactly one directory: subdirectories are never descended "
+        "into and nothing outside it is touched. Destructive: requires "
+        "confirm=true AND human approval with a full preview of every "
+        "matched file. The directory must be inside the Panjeta file "
+        "root or an allowed filesystem location with DELETE permission."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "directory": {
+                "type": "string",
+                "description": (
+                    "Directory whose direct children are candidates. "
+                    + FILE_ROOT_HINT
+                ),
+            },
+            "pattern": {
+                "type": "string",
+                "description": (
+                    "Filename glob pattern such as '*.mp4' or "
+                    "'report*.txt'. No path separators allowed."
+                ),
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Must be true. States the model's intent only; "
+                    "human approval is still required."
+                ),
+            },
+        },
+        "required": ["directory", "pattern", "confirm"],
+    },
+)
+
+
+def _validate_bulk_pattern(pattern: str) -> str:
+    """Reject patterns that try to widen the scope beyond one directory."""
+    if not pattern.strip():
+        raise ToolError("pattern must be a non-empty string.")
+    if "/" in pattern or "\\" in pattern:
+        raise ToolError(
+            f"pattern {pattern!r} must not contain path separators; the "
+            "scope of a bulk deletion is exactly one directory."
+        )
+    if pattern.strip() in (".", ".."):
+        raise ToolError(f"pattern {pattern!r} is not a valid filename glob.")
+    return pattern.strip()
+
+
+def _match_bulk_files(directory: Path, pattern: str) -> list[Path]:
+    """Direct-child files of ``directory`` matching ``pattern``.
+
+    Read-only. Never descends into subdirectories and never follows
+    links, so the match set is bounded by one directory listing.
+    Matching is case-insensitive, consistent with Windows filenames.
+    """
+    matched: list[Path] = []
+    try:
+        children = list(directory.iterdir())
+    except OSError as error:
+        raise ToolError(
+            f"Cannot list directory for matching: {error}"
+        ) from error
+    for child in children:
+        if not child.is_file() or is_link_like(child):
+            continue
+        if fnmatch.fnmatch(child.name.lower(), pattern.lower()):
+            matched.append(child)
+    return sorted(matched, key=lambda p: p.name.lower())
+
+
+def _bulk_targets(arguments: dict[str, Any]) -> tuple[Path, str, list[Path]]:
+    """Validate arguments and collect the deletion candidate list.
+
+    Shared by the tool function and its approval prompt so the human
+    sees exactly what would be deleted. Performs full permission
+    validation (the directory must allow DELETE) before any match is
+    returned -- a permission failure surfaces before approval is even
+    requested.
+    """
+    root = ensure_file_root()
+    display = _require_text(arguments, "directory")
+    confirmed = _optional_flag(arguments, "confirm", default=False)
+    if confirmed is not True:
+        raise ToolError(
+            "Bulk deletion is destructive and requires confirm=true. "
+            "Nothing was deleted."
+        )
+    pattern = _validate_bulk_pattern(_require_text(arguments, "pattern"))
+
+    directory = resolve_allowed_path(display, must_exist=True, level=DELETE)
+    if not directory.is_dir():
+        raise ToolError(
+            f"'{display}' is not a directory; delete_files only works "
+            "on one directory."
+        )
+
+    matches = _match_bulk_files(directory, pattern)
+    return directory, pattern, matches
+
+
+def _delete_files_preview(
+    directory: Path, pattern: str, matches: list[Path]
+) -> str:
+    """Human-facing preview of exactly what would be deleted."""
+    lines = [
+        f"Delete {len(matches)} file(s) matching {pattern!r} in "
+        f"'{directory}':"
+    ]
+    for index, target in enumerate(matches[:BULK_DELETE_LIST_LIMIT], 1):
+        lines.append(f"  {index}. {target.name}")
+    hidden = len(matches) - BULK_DELETE_LIST_LIMIT
+    if hidden > 0:
+        lines.append(f"  ... and {hidden} more.")
+    lines.append("This operation cannot be undone by Panjeta.")
+    return "\n".join(lines)
+
+
+
+
+def _delete_files(arguments: dict[str, Any]) -> str:
+    directory, pattern, matches = _bulk_targets(arguments)
+
+    if not matches:
+        return (
+            f"No files matching {pattern!r} directly inside "
+            f"'{directory}'. Nothing was deleted."
+        )
+    if len(matches) > MAX_BULK_DELETE_FILES:
+        raise ToolError(
+            f"{len(matches)} files match {pattern!r} in "
+            f"'{directory}', above the bulk limit of "
+            f"{MAX_BULK_DELETE_FILES}. Narrow the pattern (or move "
+            "files into smaller groups) and retry."
+        )
+
+    # Re-validate every individual target through the shared permission
+    # boundary: the canonical path of each child must still allow
+    # DELETE (e.g. a child cannot have been replaced by a link that
+    # resolves outside an authorized root between matching and now).
+    targets: list[Path] = []
+    for match in matches:
+        targets.append(
+            resolve_allowed_path(str(match), must_exist=True, level=DELETE)
+        )
+
+    deleted: list[str] = []
+    failures: list[str] = []
+    for target in targets:
+        try:
+            target.unlink()
+            deleted.append(target.name)
+        except OSError as error:
+            failures.append(f"{target.name}: {error}")
+
+    summary = (
+        f"Deleted {len(deleted)} file(s) matching {pattern!r} in "
+        f"'{directory}': {', '.join(deleted)}."
+    )
+    if failures:
+        summary += f" {len(failures)} could not be deleted: " + "; ".join(
+            failures
+        )
+    return summary
+
+
+def _delete_files_approval_prompt(arguments: dict[str, Any]) -> str:
+    """Preview the exact deletion set for the human approver."""
+    directory, pattern, matches = _bulk_targets(arguments)
+    return _delete_files_preview(directory, pattern, matches)
+
+
+def delete_files_tool() -> Tool:
+    """Return a fresh Tool instance wrapping bulk delete_files.
+
+    ``confirm=true`` only states the model's intent. Real authorisation
+    is the human approval question -- which embeds the full preview of
+    matched files -- answered by the configured Approver (default DENY).
+    """
+    return Tool(
+        definition=DELETE_FILES_DEFINITION,
+        function=_delete_files,
+        requires_approval=True,
+        approval_prompt=_delete_files_approval_prompt,
     )

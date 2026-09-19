@@ -1074,7 +1074,8 @@ class SandboxEscapeRegressionTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertTrue(
             "outside the Panjeta file root" in message
-            or "not allowed inside the Panjeta file root" in message,
+            or "not allowed inside the Panjeta file root" in message
+            or "protected system location" in message,
             f"unexpected rejection message: {message}",
         )
         return message

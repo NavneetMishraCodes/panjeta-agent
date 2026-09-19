@@ -24,10 +24,20 @@ currently provides:
   `create_file`, `copy_file`, `move_file`, `rename_file`, `delete_file`,
   `create_directory`, `delete_directory`, `move_directory`) operating
   strictly inside a configurable filesystem sandbox (`PANJETA_FILE_ROOT`).
-* A **real human-approval layer**: destructive tools (the two deletions, and
-  `create_file` with `overwrite=true`) pause and ask the actual user at the
-  console — `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text is
-  never treated as approval.
+* **Controlled computer-wide filesystem access** through an explicit,
+  user-configured permission layer: selected user locations (e.g.
+  `%USERPROFILE%\Downloads`) can be registered as allowed roots with
+  READ/WRITE/DELETE levels. System locations (`C:\Windows`, `C:\Program
+  Files`, `C:\ProgramData`, the Windows user profile itself, and more) are
+  always protected and fail closed. A scoped, preview-gated bulk
+  `delete_files` tool supports workflows such as deleting the `*.mp4`
+  files in the user's Downloads folder — with a full preview and explicit
+  human approval before anything is removed.
+* A **real human-approval layer**: destructive tools (`delete_file`,
+  `delete_directory`, bulk `delete_files`, and `create_file` with
+  `overwrite=true`) pause and ask the actual user at the console —
+  `Delete 'notes/old.txt'? [y/N]` — and default to DENY. LLM text and
+  LLM-supplied `confirm` flags are never treated as approval.
 * **Persistent session state**: the interactive conversation is stored in a
   bounded, versioned JSON file and restored on the next launch. History is
   capped by both message count and encoded size, corrupted or hand-edited
@@ -114,6 +124,13 @@ SessionStore.save  (bounded history restored on the next launch)
   (read-only filename/metadata search, contents never read), and the
   file-manager family in `src/tools/file_manager.py`, guarded by the
   sandbox in `src/tools/paths.py`. Tools never run shell commands.
+* **`src/tools/permissions.py`** — the computer-wide permission layer:
+  `FilesystemPermissions` decides, for every canonical path, which
+  configured allowed root (if any) covers it and at which operation level
+  (READ/WRITE/DELETE), and refuses protected system locations outright.
+  The LLM can only request operations; it can never grant itself access
+  or modify the permission configuration. Without explicit configuration
+  the layer grants nothing beyond the workspace sandbox — fail closed.
 * **`src/approval.py`** — the human-approval layer: the `Approver`
   protocol, the console implementation (`ConsoleApprover`, explicit
   `y`/`yes` only, default deny), and `ApprovalDeniedError`. The
@@ -159,12 +176,44 @@ the Panjeta filesystem root:
   creates only the requested directory (never a parent tree);
   `move_directory` relocates a whole directory and refuses to move it into
   itself or its own subtree.
-* **Destructive operations** (`delete_file`, `delete_directory`, and
-  `create_file` with `overwrite=true`) require real human approval at the
-  console: Panjeta prints e.g. `Delete 'notes/old.txt'? [y/N]` and only an
-  explicit `y`/`yes` proceeds — anything else, including blank input, denies
-  and nothing is touched. The two deletions additionally require the
-  tool-level `confirm=true` argument, so the model has to state its intent.
+
+### Computer-wide allowed locations (opt-in)
+
+Beyond the sandbox, Panjeta can operate on **explicitly granted** user
+locations — the example workflow is *"delete all the MP4 files in my
+Downloads folder"*:
+
+* Allowed roots are configured by the **user**, never by the model:
+  `PANJETA_ALLOWED_ROOTS` maps names to directories (e.g.
+  `Downloads=<home>\Downloads`, with `~`, `<home>`, and well-known
+  user folders such as `user:Downloads` resolvable without hardcoding a
+  username), and `PANJETA_ALLOWED_ROOTS_LEVELS` sets the granted
+  operations (`READ`, `WRITE`, `DELETE`), defaulting to `READ,WRITE`.
+* Every path — including copy/move/rename **destinations** — is
+  canonicalised (symlink/junction-aware) and then checked against the
+  permission layer: a path is authorized only if its *resolved* location
+  is covered by the workspace root or an allowed root at the required
+  level. Traversal (`Downloads\..\Documents`), siblings, ancestors, and
+  textual look-alikes are all refused.
+* **Protected system locations are always denied**, even if someone
+  configured them explicitly: `C:\Windows`, `C:\Program Files`,
+  `C:\Program Files (x86)`, `C:\ProgramData`, drive roots, and the
+  Windows user profile with its system subfolders (`AppData`,
+  `Application Data`, and others). Any ambiguity fails closed.
+* `delete_files` (bulk) matches a filename glob against the direct
+  children of exactly one directory — no subdirectories are descended
+  into, so the scope can never widen. It is capped at 100 files per
+  call, requires `confirm=true` plus human approval, and the approval
+  question embeds a **preview listing every file** that will be removed.
+* **Destructive operations** (`delete_file`, `delete_directory`, bulk
+  `delete_files`, and `create_file` with `overwrite=true`) require real
+  human approval at the console: Panjeta prints e.g.
+  `Delete 'notes/old.txt'? [y/N]` and only an explicit `y`/`yes` proceeds —
+  anything else, including blank input, denies and nothing is touched. The
+  deletions additionally require the tool-level `confirm=true` argument, so
+  the model has to state its intent. For `delete_files`, the approval
+  question contains a preview of exactly which matched files will be
+  removed.
   `delete_directory` deletes EMPTY directories only; recursive deletion does
   not exist in Panjeta.
 
@@ -213,6 +262,25 @@ Optional filesystem sandbox configuration:
 PANJETA_FILE_ROOT=
 ```
 
+Optional computer-wide allowed locations (opt-in; nothing beyond the
+sandbox is accessible unless you configure these):
+
+```dotenv
+# Comma-separated list of Name=path entries. Names are the labels the
+# model sees in tool descriptions; paths may use ~ or <home>, or refer
+# to well-known user folders as user:Downloads, user:Documents,
+# user:Desktop, user:Pictures. Example:
+PANJETA_ALLOWED_ROOTS=Downloads=user:Downloads,Documents=user:Documents
+# Granted operation levels, default READ,WRITE when unset.
+# Comma-separated subset of READ, WRITE, DELETE.
+PANJETA_ALLOWED_ROOTS_LEVELS=READ,WRITE,DELETE
+```
+
+Protected system locations (`C:\Windows`, `C:\Program Files`,
+`C:\ProgramData`, the user profile and its system subfolders, drive
+roots) are always refused and cannot be enabled — even by naming them
+explicitly in `PANJETA_ALLOWED_ROOTS`.
+
 Optional session file location (conversation persistence):
 
 ```dotenv
@@ -246,11 +314,16 @@ venv\Scripts\python.exe -m scripts.smoke_search <root> [query]
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**351 tests, all passing offline and deterministically** (2 skipped, see
+**382 tests, all passing offline and deterministically** (2 skipped, see
 below). The providers are tested with scripted fakes, the filesystem tools
 run inside temporary sandbox directories, approval is tested with scripted
 approvers and stdin, and session persistence is tested against temporary JSON
 files — no API keys or network needed.
+
+The permission layer has its own suite (`tests/test_permissions.py`): grant
+configuration and validation, protected locations, alias resolution, level
+checks, traversal/symlink/junction refusals, and the fail-closed behavior of
+the environment parsing.
 
 The suite includes a permanent offline **end-to-end harness**
 (`tests/test_e2e.py`): a `ScriptedLLM` drives the real `Agent` → real
@@ -258,6 +331,12 @@ The suite includes a permanent offline **end-to-end harness**
 calculator, `search_files`, the whole file-manager family (create, read, copy,
 move, rename, delete, directory create/delete/move), an approved deletion, a
 denied deletion, provider-failure handling, and sandbox-boundary rejection.
+`ComputerWideWorkflowTest` reproduces the target workflow inside a
+temporary fake computer — a Downloads folder with `video1.mp4`,
+`video2.mp4`, `document.pdf`, and `image.png`, a Documents folder, and a
+protected tree — where the agent searches Downloads, proposes the bulk
+deletion, hits the approval gate (once granted, once denied), and the
+result is verified file-by-file (only the two `.mp4` files ever disappear).
 It verifies integration rather than replacing the unit tests.
 
 Sandbox-escape regressions live in `tests/test_paths.py` (path resolution) and
@@ -278,19 +357,21 @@ actual link-helper bug fails the suite instead of silently skipping.
   persistent session state —
   *not* long-term semantic memory and *not* human-like memory. No
   summarization or embeddings exist.
-* Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design; there is
-  no binary/PDF/image content parsing and no search over file contents.
-* `search_files` is intentionally **not** sandboxed: finding files the user
-  points it at anywhere on the computer is its purpose. It is read-only
-  (names and metadata only, links never followed) and bounded to
-  `MAX_SCANNED_ENTRIES` (50,000) entries per search, and the result says when
-  the scan stopped early. A search rooted at a very large tree can still take
-  noticeable time; a depth-limited walk/cancellation is a Phase 10
-  reliability item rather than a Phase 9 change.
+* Filesystem tools are sandboxed to `PANJETA_FILE_ROOT` by design. Outside
+  the sandbox, only explicitly configured allowed roots are accessible, at
+  the granted READ/WRITE/DELETE levels; there is no binary/PDF/image
+  content parsing and no search over file contents.
+* `search_files` is intentionally **not** permission-restricted (its result
+  is only names/metadata, and the agent cannot mutate anything through it).
+  File mutations in allowed locations go through the permission layer and,
+  for destructive operations, human approval.
+* `delete_files` matches only the direct children of one directory (no
+  recursion) and is capped at 100 files per call.
 * `delete_directory` deletes empty directories only; recursive deletion
   does not exist anywhere in Panjeta.
 * Approval happens at the local console only (no remote/GUI approval), and
-  there is no per-tool permission configuration yet.
+  permission grants change only via the environment configuration at
+  startup — never mid-session, and never at a model's request.
 * No web access, no WhatsApp, no OCR/PDF, no browser or GUI automation, and
   no arbitrary computer control.
 
@@ -301,5 +382,5 @@ Panjeta is being built toward a general-purpose local computer agent — but
 registered, validated tools behind the sandbox, the human-approval layer,
 and the registry. The foundation (sandbox + approval + sessions +
 `ToolRegistry`) is now in place for broader capabilities next: content-aware
-features (PDFs, images, WhatsApp-style documents), richer tool families,
-and configurable permissions — each added as a separate registered tool.
+features (PDFs, images, WhatsApp-style documents) and richer tool families —
+each added as a separate registered tool.

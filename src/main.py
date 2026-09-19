@@ -139,6 +139,7 @@ def _build_registry(approver: ConsoleApprover | None = None) -> ToolRegistry:
         move_file_tool,
         rename_file_tool,
         delete_file_tool,
+        delete_files_tool,
         create_directory_tool,
         delete_directory_tool,
         move_directory_tool,

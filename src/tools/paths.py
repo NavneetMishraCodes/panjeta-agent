@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 
 from src.tools.base import ToolError
+from src.tools.permissions import READ, load_permissions
 
 FILE_ROOT_ENV_VAR = "PANJETA_FILE_ROOT"
 DEFAULT_FILE_ROOT_NAME = "panjeta_files"
@@ -92,23 +93,92 @@ def is_link_like(path: str | Path) -> bool:
     return bool(is_junction()) if callable(is_junction) else False
 
 
-def resolve_allowed_path(path: str, *, must_exist: bool = False) -> Path:
-    """Validate ``path`` against the configured root and return its location.
+def _canonicalize(candidate: Path) -> Path:
+    """Canonicalise ``candidate``; link-aware, tolerant of missing tails.
+
+    Ascends to the deepest existing ancestor and canonicalises it
+    (following symlinks/junctions); non-existing trailing components
+    (destinations of create/copy/move/rename) are rebuilt onto that
+    canonical ancestor afterwards. Containment is *not* decided here --
+    callers validate the returned path against their authorized root.
+    """
+    probe = candidate
+    suffix: list[str] = []
+    while not os.path.lexists(str(probe)):
+        suffix.append(probe.name)
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+
+    resolved = Path(os.path.realpath(str(probe)))
+    for part in reversed(suffix):
+        resolved = resolved / part
+    return resolved
+
+
+def resolve_allowed_path(
+    path: str,
+    *,
+    must_exist: bool = False,
+    level: str | None = None,
+) -> Path:
+    """Validate ``path`` and return its canonical location.
+
+    The path must resolve inside the V1 sandbox (``PANJETA_FILE_ROOT``)
+    **or** inside an explicitly configured allowed root
+    (``PANJETA_ALLOWED_ROOTS``, see :mod:`src.tools.permissions`) with
+    the permission level this call requires.
 
     Args:
-        path: User-supplied path string (relative or absolute).
+        path: User-supplied path string (relative or absolute). A
+            leading *alias* (an allowed root's short name, e.g.
+            ``Downloads\\video.mp4``) is expanded to its real location
+            before validation.
         must_exist: When True, the resolved target must already exist on
             disk (for reads, deletes, and sources).
+        level: The permission level this operation requires: ``READ``
+            (read/list), ``WRITE`` (create/modify), or ``DELETE``
+            (remove). Defaults to READ for backward compatibility with
+            callers that only inspect existing content.
 
     Returns:
-        The safe canonical Path inside the root.
+        The safe canonical Path.
 
     Raises:
-        ToolError: If the path is invalid, contains ``..``, leaves the
-            root, or (when ``must_exist``) does not exist.
+        ToolError: If the path is invalid, contains ``..``, leaves
+            every authorized root, lacks the required permission level,
+            or (when ``must_exist``) does not exist.
     """
+    level = level if level is not None else READ
+    if not isinstance(path, str) or not path.strip():
+        raise ToolError("Path must be a non-empty string.")
+
+    raw_path = Path(path.strip()).expanduser()
+    if ".." in raw_path.parts:
+        raise ToolError(
+            f"Path {path!r} contains '..', which is not allowed."
+        )
+
     root = ensure_file_root()
-    return resolve_within_root(root, path, must_exist=must_exist)
+    permissions = load_permissions(root)
+    effective = permissions.resolve_alias(path)
+    effective_path = Path(effective)
+    if effective_path.is_absolute():
+        candidate = effective_path
+    else:
+        # Relative paths always live inside the workspace sandbox.
+        candidate = root / effective_path
+    candidate = Path(os.path.abspath(str(candidate)))
+    # Canonicalise first (symlink/junction-aware), then decide. The
+    # permission layer is the single authority for which root covers the
+    # canonical path and at what level; textual similarity never grants
+    # anything.
+    resolved = _canonicalize(candidate)
+    permissions.check(resolved, level)
+    if must_exist and not os.path.lexists(str(resolved)):
+        raise ToolError(f"Path does not exist: {path!r}.")
+    return resolved
 
 
 def resolve_within_root(
@@ -134,22 +204,7 @@ def resolve_within_root(
     candidate = raw_path if raw_path.is_absolute() else root / raw_path
     candidate = Path(os.path.abspath(str(candidate)))
 
-    # Ascend to the deepest existing ancestor and canonicalise it (following
-    # symlinks/junctions); non-existing trailing components (destinations of
-    # create/copy/move/rename) are rebuilt onto that canonical ancestor
-    # afterwards.
-    probe = candidate
-    suffix: list[str] = []
-    while not os.path.lexists(str(probe)):
-        suffix.append(probe.name)
-        parent = probe.parent
-        if parent == probe:
-            break
-        probe = parent
-
-    resolved = Path(os.path.realpath(str(probe)))
-    for part in reversed(suffix):
-        resolved = resolved / part
+    resolved = _canonicalize(candidate)
 
     # Containment is decided on the final resolved path and never the other
     # way round: the target must live *inside* the root. Checking whether the
